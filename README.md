@@ -11,8 +11,13 @@ docs/build-plan.md     The full design + phased build plan (start here)
 cmd/detonator/         The proxy binary
 internal/
   proxy/               npm + PyPI pull-through registry (the enforcement point)
-  cache/               content-addressed artifacts + verdicts, TTL'd metadata
-  gate/                admission-gate interface (Phase 1: always-allow stub)
+  cache/               content-addressed artifacts + verdicts, TTL'd metadata, history
+  gate/                admission gate: allow-all stub + static-analysis pipeline
+  artifact/            bounded npm/PyPI unpacking (inspection only, never executes)
+  analyze/static/      install-hook / setup.py / obfuscation / secret rules
+  analyze/osv/         OSV.dev known-vuln lookup
+  analyze/differ/      version-over-version diff (surfaces new install hooks)
+  engine/              signal → verdict, with policy (fail-to-review default)
   verdict/             shared verdict / artifact / signal types
   config/              runtime config
 phase0/                Turnkey Phase 0: stand up a burner, prove the telemetry + verdict path
@@ -33,12 +38,15 @@ pip install --index-url http://127.0.0.1:8080/pypi/simple/ <pkg>
 ```
 
 Every artifact download is routed through the admission gate and cached by
-digest. In Phase 1 the gate admits everything — the point is to prove the proxy
-is a transparent drop-in before real analysis lands (build-plan §5).
+digest. The default `--gate static` runs the analysis pipeline (static rules +
+OSV + version diff) and blocks on known-critical vulns or obvious install-script
+malware; `--gate allow-all` is the transparent Phase-1 stub. Flags: `--osv` /
+`--osv-url`, `--fail-closed` (block instead of quarantine on uncertainty).
 
 ## Safety
 
 This repo contains **no malware**. Phase 0 validates the pipeline with benign packages and a synthetic sample. Live samples from `ossf/malicious-packages` run **only** on the disposable burner in Phase 3 — never on a laptop, never in a general-purpose environment.
 
-Status: Phase 1 (the gate, dumb) — proxy is transparent for `npm install` /
-`pip install`, always-allow gate. See `docs/build-plan.md` §5 for the roadmap.
+Status: Phase 2 (static + OSV + differ) — the gate blocks on known-critical CVEs
+and obvious install-script malware while staying transparent for clean packages.
+Detonation (Phase 3) is next and needs the burner. See `docs/build-plan.md` §5.

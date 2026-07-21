@@ -199,6 +199,62 @@ func (c *Cache) PutLocator(key, digest string) error {
 	return c.atomicWrite(c.locatorPath(key), []byte(digest))
 }
 
+// ---- package history (per package, in encounter order) ----
+//
+// The differ needs the previous version's bytes to diff against. History is an
+// append-only log per (ecosystem, name), in the order versions were first seen
+// and served, so "last known-good" is just the most recent allowed entry.
+
+// HistoryEntry records one version the proxy has served.
+type HistoryEntry struct {
+	Version  string    `json:"version"`
+	Digest   string    `json:"digest"`
+	Decision string    `json:"decision"`
+	SeenAt   time.Time `json:"seen_at"`
+}
+
+func (c *Cache) historyPath(eco, name string) string {
+	h := sha256.Sum256([]byte(eco + "\x00" + name))
+	return filepath.Join(c.root, "metadata", "hist-"+hex.EncodeToString(h[:]))
+}
+
+// GetHistory returns the recorded versions for a package, oldest first.
+func (c *Cache) GetHistory(eco, name string) ([]HistoryEntry, error) {
+	b, err := os.ReadFile(c.historyPath(eco, name))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var entries []HistoryEntry
+	if err := json.Unmarshal(b, &entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// AppendHistory records that a version was served. It de-dupes on digest so a
+// repeated request doesn't grow the log; a re-request under the caller's key
+// lock keeps this safe from concurrent double-append.
+func (c *Cache) AppendHistory(eco, name string, e HistoryEntry) error {
+	entries, err := c.GetHistory(eco, name)
+	if err != nil {
+		return err
+	}
+	for _, existing := range entries {
+		if existing.Digest == e.Digest {
+			return nil
+		}
+	}
+	entries = append(entries, e)
+	b, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return err
+	}
+	return c.atomicWrite(c.historyPath(eco, name), b)
+}
+
 // ---- verdicts (content-addressed by artifact digest) ----
 
 func (c *Cache) verdictPath(digest string) (string, error) {

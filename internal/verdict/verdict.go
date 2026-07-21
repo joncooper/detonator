@@ -55,14 +55,24 @@ const (
 	SevCritical Severity = "critical"
 )
 
+// DiffSummary is the file-level change from the previous known-good version,
+// carried on the verdict so a reviewer can see what changed.
+type DiffSummary struct {
+	PrevVersion string   `json:"prev_version"`
+	Added       []string `json:"added,omitempty"`
+	Removed     []string `json:"removed,omitempty"`
+	Modified    []string `json:"modified,omitempty"`
+}
+
 // Verdict is the composite decision for an artifact, with the signals that
 // produced it. It is the unit stored, cached, and (later) signed.
 type Verdict struct {
-	Artifact  Artifact  `json:"artifact"`
-	Decision  Decision  `json:"decision"`
-	Reason    string    `json:"reason"`
-	Signals   []Signal  `json:"signals,omitempty"`
-	DecidedAt time.Time `json:"decided_at"`
+	Artifact  Artifact     `json:"artifact"`
+	Decision  Decision     `json:"decision"`
+	Reason    string       `json:"reason"`
+	Signals   []Signal     `json:"signals,omitempty"`
+	Diff      *DiffSummary `json:"diff,omitempty"`
+	DecidedAt time.Time    `json:"decided_at"`
 	// Engine records which pipeline produced this verdict, for auditability.
 	Engine string `json:"engine"`
 }

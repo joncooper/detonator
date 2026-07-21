@@ -19,8 +19,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joncooper/detonator/internal/analyze/osv"
 	"github.com/joncooper/detonator/internal/cache"
 	"github.com/joncooper/detonator/internal/config"
+	"github.com/joncooper/detonator/internal/engine"
 	"github.com/joncooper/detonator/internal/gate"
 	"github.com/joncooper/detonator/internal/proxy"
 )
@@ -36,6 +38,10 @@ func main() {
 	flag.StringVar(&cfg.PyPIFilesUpstream, "pypi-files-upstream", cfg.PyPIFilesUpstream, "PyPI file host upstream")
 	flag.IntVar(&cfg.MetadataTTLSeconds, "metadata-ttl", cfg.MetadataTTLSeconds, "seconds to serve cached metadata before revalidating")
 	flag.StringVar(&logLevel, "log-level", "info", "log level: debug, info, warn, error")
+	gateKind := flag.String("gate", "static", "admission gate: 'static' (analyze) or 'allow-all' (transparent stub)")
+	osvURL := flag.String("osv-url", "https://api.osv.dev", "OSV API base URL")
+	enableOSV := flag.Bool("osv", true, "enable OSV known-vuln lookup")
+	failClosed := flag.Bool("fail-closed", false, "block on uncertainty instead of quarantining for review")
 	flag.Parse()
 
 	log := newLogger(logLevel)
@@ -51,7 +57,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := proxy.New(cfg, c, gate.AllowAll{}, log)
+	g := buildGate(*gateKind, c, *osvURL, *enableOSV, *failClosed, log)
+	srv := proxy.New(cfg, c, g, log)
 	httpSrv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           srv.Handler(),
@@ -68,7 +75,7 @@ func main() {
 			"public_url", cfg.PublicURL,
 			"npm_registry", cfg.PublicURL+"/npm/",
 			"pypi_index", cfg.PublicURL+"/pypi/simple/",
-			"gate", "allow-all (phase 1)")
+			"gate", *gateKind)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server failed", "err", err)
 			os.Exit(1)
@@ -82,6 +89,23 @@ func main() {
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		log.Error("shutdown error", "err", err)
 	}
+}
+
+// buildGate constructs the admission gate selected on the command line.
+func buildGate(kind string, c *cache.Cache, osvURL string, enableOSV, failClosed bool, log *slog.Logger) gate.Gate {
+	if kind == "allow-all" {
+		log.Warn("gate is allow-all: every package is admitted without analysis")
+		return gate.AllowAll{}
+	}
+	opts := gate.PipelineOptions{
+		Cache:  c,
+		Policy: engine.Policy{FailClosed: failClosed},
+		Logger: log,
+	}
+	if enableOSV {
+		opts.OSV = osv.New(osvURL)
+	}
+	return gate.NewPipeline(opts)
 }
 
 func newLogger(level string) *slog.Logger {
