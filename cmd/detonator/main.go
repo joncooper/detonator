@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -25,6 +26,8 @@ import (
 	"github.com/joncooper/detonator/internal/engine"
 	"github.com/joncooper/detonator/internal/gate"
 	"github.com/joncooper/detonator/internal/proxy"
+	"github.com/joncooper/detonator/internal/sign"
+	"github.com/joncooper/detonator/internal/triage"
 )
 
 func main() {
@@ -42,6 +45,11 @@ func main() {
 	osvURL := flag.String("osv-url", "https://api.osv.dev", "OSV API base URL")
 	enableOSV := flag.Bool("osv", true, "enable OSV known-vuln lookup")
 	failClosed := flag.Bool("fail-closed", false, "block on uncertainty instead of quarantining for review")
+	triageKind := flag.String("triage", "off", "LLM triage: 'off', 'mock' (local), or 'codex' (sends source to OpenAI)")
+	triageModel := flag.String("triage-model", "gpt-5.6-sol-medium", "codex model tier for triage")
+	triageSchema := flag.String("triage-schema", "phase0/verdict-schema.json", "output schema for codex triage")
+	doSign := flag.Bool("sign", true, "sign cached verdicts so they can't be forged")
+	signingKey := flag.String("signing-key", "", "path to ed25519 signing key (default: <cache-dir>/signing-key)")
 	flag.Parse()
 
 	log := newLogger(logLevel)
@@ -57,7 +65,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	g := buildGate(*gateKind, c, *osvURL, *enableOSV, *failClosed, log)
+	if *doSign {
+		keyPath := *signingKey
+		if keyPath == "" {
+			keyPath = filepath.Join(cfg.CacheDir, "signing-key")
+		}
+		signer, err := sign.LoadOrCreateEd25519(keyPath)
+		if err != nil {
+			log.Error("signing key init failed", "err", err)
+			os.Exit(1)
+		}
+		c.SetSigner(signer)
+		log.Info("verdict signing enabled", "key_id", signer.KeyID(), "alg", signer.Algorithm())
+	}
+
+	model := buildModel(*triageKind, *triageModel, *triageSchema, log)
+	g := buildGate(*gateKind, c, *osvURL, *enableOSV, *failClosed, model, log)
 	srv := proxy.New(cfg, c, g, log)
 	httpSrv := &http.Server{
 		Addr:              cfg.Listen,
@@ -92,13 +115,14 @@ func main() {
 }
 
 // buildGate constructs the admission gate selected on the command line.
-func buildGate(kind string, c *cache.Cache, osvURL string, enableOSV, failClosed bool, log *slog.Logger) gate.Gate {
+func buildGate(kind string, c *cache.Cache, osvURL string, enableOSV, failClosed bool, model triage.Model, log *slog.Logger) gate.Gate {
 	if kind == "allow-all" {
 		log.Warn("gate is allow-all: every package is admitted without analysis")
 		return gate.AllowAll{}
 	}
 	opts := gate.PipelineOptions{
 		Cache:  c,
+		Model:  model,
 		Policy: engine.Policy{FailClosed: failClosed},
 		Logger: log,
 	}
@@ -106,6 +130,24 @@ func buildGate(kind string, c *cache.Cache, osvURL string, enableOSV, failClosed
 		opts.OSV = osv.New(osvURL)
 	}
 	return gate.NewPipeline(opts)
+}
+
+// buildModel constructs the triage model selected on the command line. The
+// codex path sends package source to a third party, so it is opt-in and warns.
+func buildModel(kind, modelName, schemaPath string, log *slog.Logger) triage.Model {
+	switch kind {
+	case "off", "":
+		return nil
+	case "mock":
+		log.Info("triage: local mock model (no source leaves this machine)")
+		return triage.MockModel{}
+	case "codex":
+		log.Warn("triage: codex model ENABLED — package source will be sent to OpenAI", "model", modelName)
+		return triage.NewCodex(schemaPath, modelName)
+	default:
+		log.Warn("unknown triage kind, disabling", "kind", kind)
+		return nil
+	}
 }
 
 func newLogger(level string) *slog.Logger {

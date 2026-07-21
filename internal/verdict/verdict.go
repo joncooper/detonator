@@ -1,9 +1,12 @@
 // Package verdict defines the admission decision types shared across the
 // pipeline. A verdict is content-addressed by the artifact it judges, so it can
-// be cached and (from Phase 4) cosign-signed and shared across a team.
+// be cached and (from Phase 4) signed and shared across a team.
 package verdict
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Decision is the admission outcome for one package artifact.
 type Decision string
@@ -75,4 +78,24 @@ type Verdict struct {
 	DecidedAt time.Time    `json:"decided_at"`
 	// Engine records which pipeline produced this verdict, for auditability.
 	Engine string `json:"engine"`
+}
+
+// Canonical returns the deterministic byte encoding of v that is signed and
+// verified. Struct fields marshal in declaration order and the signals slice is
+// already severity-sorted, so the same verdict always yields the same bytes —
+// the property a signature depends on. A forged or tampered cached "allow"
+// won't verify against these bytes.
+func (v Verdict) Canonical() ([]byte, error) {
+	return json.Marshal(v)
+}
+
+// SignedVerdict wraps a verdict with a detached signature over its canonical
+// bytes, so a cached decision shared across a team can't be forged (build-plan
+// §3, "cosign-sign the verdict"). The signing backend is pluggable; the wire
+// shape records which one produced it.
+type SignedVerdict struct {
+	Verdict   Verdict `json:"verdict"`
+	Algorithm string  `json:"algorithm"` // e.g. "ed25519"
+	KeyID     string  `json:"key_id"`    // identifies the signing key
+	Signature string  `json:"signature"` // base64(detached signature)
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/joncooper/detonator/internal/artifact"
 	"github.com/joncooper/detonator/internal/cache"
 	"github.com/joncooper/detonator/internal/engine"
+	"github.com/joncooper/detonator/internal/triage"
 	"github.com/joncooper/detonator/internal/verdict"
 )
 
@@ -20,7 +21,8 @@ import (
 // signal stages behind this same interface.
 type Pipeline struct {
 	cache  *cache.Cache
-	osv    *osv.Client // nil disables OSV lookup
+	osv    *osv.Client  // nil disables OSV lookup
+	model  triage.Model // nil disables LLM triage
 	policy engine.Policy
 	log    *slog.Logger
 }
@@ -29,13 +31,14 @@ type Pipeline struct {
 type PipelineOptions struct {
 	Cache  *cache.Cache
 	OSV    *osv.Client
+	Model  triage.Model
 	Policy engine.Policy
 	Logger *slog.Logger
 }
 
 // NewPipeline builds a Pipeline gate.
 func NewPipeline(o PipelineOptions) *Pipeline {
-	return &Pipeline{cache: o.Cache, osv: o.OSV, policy: o.Policy, log: o.Logger}
+	return &Pipeline{cache: o.Cache, osv: o.OSV, model: o.Model, policy: o.Policy, log: o.Logger}
 }
 
 // Admit runs the static-analysis pipeline and returns a verdict.
@@ -78,11 +81,81 @@ func (p *Pipeline) Admit(ctx context.Context, art verdict.Artifact, data []byte)
 		}
 	}
 
-	v := engine.Decide(art, signals, p.policy, "static-pipeline")
+	// LLM triage sees the deterministic signals and renders its own judgment;
+	// the engine, not the model, makes the final call. Rules/LLM disagreement is
+	// itself a signal (build-plan §4).
+	engineName := "static-pipeline"
+	if p.model != nil {
+		signals = append(signals, p.triageSignals(ctx, art, signals, diff, u)...)
+		engineName = "static+triage-pipeline"
+	}
+
+	v := engine.Decide(art, signals, p.policy, engineName)
 	v.Diff = diff
 
 	p.recordHistory(art, v.Decision)
 	return v, nil
+}
+
+// triageSignals runs the LLM triage model and returns its judgment as signals,
+// plus a disagreement signal when the model and the deterministic rules diverge
+// on whether to clear the package.
+func (p *Pipeline) triageSignals(ctx context.Context, art verdict.Artifact, detSignals []verdict.Signal, diff *verdict.DiffSummary, u *artifact.Unpacked) []verdict.Signal {
+	in := triage.Input{
+		Artifact:       art,
+		StaticSignals:  detSignals,
+		Diff:           diff,
+		SourceExcerpts: selectExcerpts(u),
+	}
+	out, err := p.model.Classify(ctx, in)
+	if err != nil {
+		p.log.Warn("triage failed", "artifact", art.Name, "err", err)
+		return []verdict.Signal{{
+			Stage: "triage", Rule: "triage-unavailable", Severity: verdict.SevInfo,
+			Description: "LLM triage unavailable", Evidence: err.Error(),
+		}}
+	}
+	sigs := []verdict.Signal{out.ToSignal(p.model.Name())}
+
+	rulesDecision := engine.Decide(art, detSignals, p.policy, "rules-only").Decision
+	if clears(rulesDecision) != clears(out.Decision) {
+		sigs = append(sigs, verdict.Signal{
+			Stage: "triage", Rule: "rules-llm-disagreement", Severity: verdict.SevMedium,
+			Description: "deterministic rules and LLM triage disagree on clearing this package",
+			Evidence:    "rules=" + string(rulesDecision) + " " + p.model.Name() + "=" + string(out.Decision),
+		})
+	}
+	return sigs
+}
+
+// clears reports whether a decision would admit the package.
+func clears(d verdict.Decision) bool { return d == verdict.Allow }
+
+// selectExcerpts returns a small, bounded set of the files most worth a model's
+// attention — install/build scripts and entry points — never the whole package.
+func selectExcerpts(u *artifact.Unpacked) map[string]string {
+	if u == nil {
+		return nil
+	}
+	const maxFiles, maxBytes = 6, 8 << 10
+	interesting := []string{
+		"package.json", "setup.py", "setup.cfg", "pyproject.toml",
+		"index.js", "main.js", "__init__.py",
+	}
+	out := map[string]string{}
+	for _, name := range interesting {
+		if len(out) >= maxFiles {
+			break
+		}
+		if f := u.Lookup(name); f != nil {
+			c := f.Content
+			if len(c) > maxBytes {
+				c = c[:maxBytes]
+			}
+			out[name] = string(c)
+		}
+	}
+	return out
 }
 
 // previousGood returns the unpacked bytes of the most recent prior version that

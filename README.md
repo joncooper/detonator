@@ -18,6 +18,8 @@ internal/
   analyze/osv/         OSV.dev known-vuln lookup
   analyze/differ/      version-over-version diff (surfaces new install hooks)
   engine/              signal → verdict, with policy (fail-to-review default)
+  triage/              pluggable LLM triage: Model interface + mock + Codex
+  sign/                verdict signing (ed25519 default; cosign backend seam)
   verdict/             shared verdict / artifact / signal types
   config/              runtime config
 phase0/                Turnkey Phase 0: stand up a burner, prove the telemetry + verdict path
@@ -40,13 +42,22 @@ pip install --index-url http://127.0.0.1:8080/pypi/simple/ <pkg>
 Every artifact download is routed through the admission gate and cached by
 digest. The default `--gate static` runs the analysis pipeline (static rules +
 OSV + version diff) and blocks on known-critical vulns or obvious install-script
-malware; `--gate allow-all` is the transparent Phase-1 stub. Flags: `--osv` /
-`--osv-url`, `--fail-closed` (block instead of quarantine on uncertainty).
+malware; `--gate allow-all` is the transparent Phase-1 stub.
+
+Flags:
+- `--osv` / `--osv-url` — OSV known-vuln lookup
+- `--fail-closed` — block instead of quarantine on uncertainty
+- `--triage` — LLM triage: `off` (default), `mock` (local), or `codex`
+  (**sends package source to OpenAI**; opt-in, warns on start)
+- `--sign` / `--signing-key` — sign cached verdicts (ed25519) so they can't be
+  forged; a tampered or unsigned cache entry is re-analyzed, not trusted
 
 ## Safety
 
 This repo contains **no malware**. Phase 0 validates the pipeline with benign packages and a synthetic sample. Live samples from `ossf/malicious-packages` run **only** on the disposable burner in Phase 3 — never on a laptop, never in a general-purpose environment.
 
-Status: Phase 2 (static + OSV + differ) — the gate blocks on known-critical CVEs
-and obvious install-script malware while staying transparent for clean packages.
-Detonation (Phase 3) is next and needs the burner. See `docs/build-plan.md` §5.
+Status: Phases 1–2 complete; Phase 4 machinery landed (verdict signing +
+pluggable triage interface with a local mock; live Codex is opt-in). Phase 3
+(detonation) and Phase 0 telemetry validation need the burner — next up. Phase 4
+triage will consume the detonation behavior log once Phase 3 lands. See
+`docs/build-plan.md` §5.

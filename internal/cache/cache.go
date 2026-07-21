@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/joncooper/detonator/internal/sign"
 	"github.com/joncooper/detonator/internal/verdict"
 )
 
@@ -28,10 +29,15 @@ var ErrMiss = errors.New("cache: miss")
 
 // Cache is a filesystem-backed store rooted at a single directory.
 type Cache struct {
-	root string
-	ttl  time.Duration
-	keys *keyedMutex
+	root   string
+	ttl    time.Duration
+	keys   *keyedMutex
+	signer sign.Signer // nil = verdicts stored unsigned (pre-Phase-4)
 }
+
+// SetSigner enables signed verdicts: PutVerdict signs, GetVerdict verifies and
+// treats an unsigned or forged entry as a miss so it is re-analyzed.
+func (c *Cache) SetSigner(s sign.Signer) { c.signer = s }
 
 // New opens (creating if needed) a cache rooted at dir, serving metadata for ttl
 // before it is treated as stale.
@@ -266,6 +272,9 @@ func (c *Cache) verdictPath(digest string) (string, error) {
 }
 
 // GetVerdict returns the cached verdict for an artifact digest, or ErrMiss.
+// When a signer is configured, a stored entry must carry a valid signature from
+// the known key; an unsigned or forged entry is treated as a miss so it is
+// re-analyzed rather than trusted.
 func (c *Cache) GetVerdict(digest string) (verdict.Verdict, error) {
 	p, err := c.verdictPath(digest)
 	if err != nil {
@@ -278,6 +287,27 @@ func (c *Cache) GetVerdict(digest string) (verdict.Verdict, error) {
 	if err != nil {
 		return verdict.Verdict{}, err
 	}
+
+	if isSignedEnvelope(b) {
+		var sv verdict.SignedVerdict
+		if err := json.Unmarshal(b, &sv); err != nil {
+			return verdict.Verdict{}, ErrMiss
+		}
+		if c.signer == nil {
+			// Have a signed entry but no verifier: don't trust it blindly.
+			return verdict.Verdict{}, ErrMiss
+		}
+		if err := c.signer.Verify(sv); err != nil {
+			return verdict.Verdict{}, ErrMiss
+		}
+		return sv.Verdict, nil
+	}
+
+	// Unsigned entry.
+	if c.signer != nil {
+		// A signer is configured but this entry predates signing: re-analyze.
+		return verdict.Verdict{}, ErrMiss
+	}
 	var v verdict.Verdict
 	if err := json.Unmarshal(b, &v); err != nil {
 		return verdict.Verdict{}, err
@@ -285,17 +315,42 @@ func (c *Cache) GetVerdict(digest string) (verdict.Verdict, error) {
 	return v, nil
 }
 
-// PutVerdict stores v, keyed by its artifact digest.
+// PutVerdict stores v, keyed by its artifact digest. If a signer is configured
+// the verdict is signed so a shared or cached decision can't be forged.
 func (c *Cache) PutVerdict(v verdict.Verdict) error {
 	p, err := c.verdictPath(v.Artifact.Digest)
 	if err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
+	var b []byte
+	if c.signer != nil {
+		sv, err := c.signer.Sign(v)
+		if err != nil {
+			return err
+		}
+		b, err = json.MarshalIndent(sv, "", "  ")
+		if err != nil {
+			return err
+		}
+	} else {
+		b, err = json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			return err
+		}
 	}
 	return c.atomicWrite(p, b)
+}
+
+// isSignedEnvelope reports whether stored bytes are a SignedVerdict (they carry
+// a top-level "signature") rather than a bare Verdict.
+func isSignedEnvelope(b []byte) bool {
+	var probe struct {
+		Signature *string `json:"signature"`
+	}
+	if json.Unmarshal(b, &probe) != nil {
+		return false
+	}
+	return probe.Signature != nil
 }
 
 // ---- internals ----

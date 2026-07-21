@@ -14,8 +14,58 @@ import (
 	"github.com/joncooper/detonator/internal/cache"
 	"github.com/joncooper/detonator/internal/engine"
 	"github.com/joncooper/detonator/internal/testutil"
+	"github.com/joncooper/detonator/internal/triage"
 	"github.com/joncooper/detonator/internal/verdict"
 )
+
+// stubModel returns a fixed decision, to exercise the rules/LLM blend.
+type stubModel struct{ decision verdict.Decision }
+
+func (m stubModel) Name() string { return "stub" }
+func (m stubModel) Classify(_ context.Context, _ triage.Input) (triage.Output, error) {
+	return triage.Output{Decision: m.decision, Confidence: 0.9, Rationale: "stub"}, nil
+}
+
+// TestPipelineDisagreementQuarantines: rules would allow a clean package, but
+// the model says block. The disagreement itself must surface and push the
+// package to review rather than a silent allow (build-plan §4).
+func TestPipelineDisagreementQuarantines(t *testing.T) {
+	c := testCache(t)
+	p := NewPipeline(PipelineOptions{
+		Cache: c, Model: stubModel{decision: verdict.Block},
+		Policy: engine.DefaultPolicy(), Logger: quietLog(),
+	})
+	data := testutil.NPMTarball(map[string]string{"package.json": `{"name":"clean","version":"1.0.0"}`})
+	v := admit(t, p, c, "clean", "1.0.0", data)
+
+	var sawDisagreement bool
+	for _, s := range v.Signals {
+		if s.Rule == "rules-llm-disagreement" {
+			sawDisagreement = true
+		}
+	}
+	if !sawDisagreement {
+		t.Fatalf("expected rules-llm-disagreement signal: %+v", v.Signals)
+	}
+	if v.Decision == verdict.Allow {
+		t.Fatalf("disagreement should not be a silent allow, got %s", v.Decision)
+	}
+}
+
+func TestPipelineTriageAgreesAllowsClean(t *testing.T) {
+	c := testCache(t)
+	p := NewPipeline(PipelineOptions{
+		Cache: c, Model: triage.MockModel{},
+		Policy: engine.DefaultPolicy(), Logger: quietLog(),
+	})
+	data := testutil.NPMTarball(map[string]string{
+		"package.json": `{"name":"clean","version":"1.0.0"}`,
+		"index.js":     `module.exports = 1;`,
+	})
+	if v := admit(t, p, c, "clean", "1.0.0", data); v.Decision != verdict.Allow {
+		t.Fatalf("clean package with agreeing mock should allow, got %s: %+v", v.Decision, v.Signals)
+	}
+}
 
 func testCache(t *testing.T) *cache.Cache {
 	t.Helper()
