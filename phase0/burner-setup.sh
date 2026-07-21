@@ -28,9 +28,10 @@ runsc install                 # writes the runsc runtime into /etc/docker/daemon
 systemctl restart docker
 
 # ---- Host lockdown: black-hole the cloud metadata endpoint ----
-# Belt-and-suspenders: IMDS is already disabled at the instance level and no IAM role
-# is attached, so there are no credentials to reach — but this also protects the
-# container network path and any future re-enable.
+# IMDS was left reachable at launch only so cloud-init could fetch the SSH key
+# and this very script. Provisioning is done now, so blackhole it: no IAM role is
+# attached (nothing to steal) and the launch set IMDSv2 + hop-limit 1, but this
+# closes the endpoint entirely for the detonation runs that follow.
 iptables  -I OUTPUT  -d 169.254.169.254 -j DROP
 iptables  -I FORWARD -d 169.254.169.254 -j DROP
 netfilter-persistent save

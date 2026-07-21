@@ -61,14 +61,20 @@ aws ec2 authorize-security-group-ingress --region "$REGION" \
 echo "Security group: $SG_ID (ssh from ${MY_IP}/32)"
 
 # Launch. The deliberate hardening:
-#   * NO --iam-instance-profile   -> the instance carries ZERO AWS credentials
-#   * --metadata-options disabled -> 169.254.169.254 (IMDS) answers nothing, even if reached
+#   * NO --iam-instance-profile   -> the instance carries ZERO AWS credentials,
+#     so IMDS exposes nothing worth stealing even while it is reachable.
+#   * IMDSv2 required + hop limit 1 -> the metadata endpoint stays reachable for
+#     cloud-init at first boot (it fetches the SSH key AND the user-data script
+#     from IMDS — disabling it at launch breaks provisioning entirely), but a
+#     token is required and the 1-hop TTL blocks the container/pod escape path
+#     (the 2020 GKE metadata-API vector). burner-setup.sh then iptables-blackholes
+#     IMDS once provisioning is done — belt-and-suspenders, at the right moment.
 #   * shutdown-behavior terminate -> `sudo shutdown -h now` on the box destroys it ("burn per batch")
 #   * encrypted root volume, deleted on termination
 INSTANCE_ID=$(aws ec2 run-instances --region "$REGION" \
   --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" \
   --key-name "$KEY_NAME" --security-group-ids "$SG_ID" \
-  --metadata-options "HttpEndpoint=disabled" \
+  --metadata-options "HttpEndpoint=enabled,HttpTokens=required,HttpPutResponseHopLimit=1" \
   --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":40,"VolumeType":"gp3","Encrypted":true,"DeleteOnTermination":true}}]' \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=detonator-burner},{Key=purpose,Value=malware-detonation},{Key=ephemeral,Value=true}]' \
   --user-data file://burner-setup.sh \
