@@ -1,9 +1,10 @@
 # Detonator — A Supply-Chain Admission Gate for npm & PyPI
 
-**Build plan v0.3 · July 2026**
+**Build plan v0.4 · July 2026**
 
 A local registry proxy that refuses to serve a package version to your machine until it has been statically scanned, detonated in a sandbox, behaviorally judged, and diffed against the last known-good version. Nothing installs until it earns a verdict.
 
+> Changed in v0.4: the §7 open decisions are resolved — triage model (GPT-5.6 Sol Medium), burner lifecycle (spin-up-per-batch, EC2, custom AMI), cache (local-first but signed from day one), and quarantine default (fail-to-review). See §7.
 > Changed in v0.3: no third-party malicious package ever runs outside the burner. The early spike (Phase 0) validates the telemetry path with benign + synthetic samples only; live-corpus detonation waits for the burner in Phase 3. (v0.2 moved detonation off localhost onto a disposable burner host and replaced host-side Falco with gVisor's own trace points, since Falco can't see guest syscalls under gVisor.) See §3, §5, §6.
 
 ---
@@ -127,13 +128,15 @@ Rough total: ~3–4 months to a defensible v1 for one engineer, faster with two 
 
 ---
 
-## 7. Open decisions for you
+## 7. Decisions
 
-- **Codex model tier & auth** for the triage stage (`gpt-5.4` vs `-mini`; subscription OAuth vs API key) — affects cost and where source code travels.
-- **Burner lifecycle** — one long-lived-but-wiped instance, or spin-up-per-batch (cleaner, slower cold start)? And local microVM vs. always-EC2? You've offered an EC2 node, so Phase 3 assumes cloud; worth deciding if local Firecracker is wanted for offline/air-gapped use too.
-- **Team vs. solo cache** — is the signed verdict store shared from day one, or local-first with sharing later?
-- **Quarantine default** — when signals disagree, do we fail-closed (block, safest) or fail-to-review (queue, less disruptive)? I've assumed queue.
-- **Scope creep guardrail** — containers/OCI, Rust/Go, and editor extensions are all real attack surfaces; v1 is npm + PyPI, the rest is v2 on the same pipeline shape. (Confirmed.)
+Resolved July 2026. Each preserves the design's two biases — precision over recall, and *make escape worthless, not impossible* — and keeps the expensive or irreversible choices (shared-store service, local microVM, fail-closed) as later opt-ins rather than day-one commitments.
+
+- **Codex model tier & auth → GPT-5.6 Sol Medium, OAuth for dev.** Triage is the load-bearing security judgment, and it runs once per new version and is cached, so the cost is amortized — no reason to weaken it with a `-mini` tier. Default the triage model to GPT-5.6 Sol Medium. Auth via subscription OAuth (`~/.codex/auth.json`) while this is a solo spike; add the API-key path when there's CI. The pluggable model interface stays the escape hatch for source we won't send to a third party.
+- **Burner lifecycle → spin-up-per-batch, EC2-only, custom AMI.** Per-batch teardown *is* the containment story, so the burner stays disposable — no long-lived-but-wiped host to drift. Kill the 3–5 min cloud-init cold start by baking a custom AMI (Docker + gVisor + package-analysis pre-installed) once Phase 0 proves the setup. Skip local Firecracker for v1, but define the burner as a narrow interface — take an artifact, return a behavior log — so a local-microVM driver can slot in later for air-gapped use without touching the pipeline.
+- **Cache → local-first, signed from day one.** The shared distribution service is deferred, but the two things that make sharing possible later are cheap now and painful to retrofit: content-addressed keys `(ecosystem, name, version, digest)` and a cosign signature on every verdict. Include both from the start; ship the team-shared store later. A schema decision, not a service decision.
+- **Quarantine default → fail-to-review (queue), policy-configurable.** A false block stalls a build and burns trust; a queue entry doesn't. Default to queue, expose it as org policy so a high-security org can flip to fail-closed. Rule/LLM disagreement stays a first-class quarantine trigger either way.
+- **Scope guardrail → npm + PyPI for v1.** Containers/OCI, Rust/Go, and editor extensions are real attack surfaces but v2, on the same pipeline shape.
 
 ---
 
