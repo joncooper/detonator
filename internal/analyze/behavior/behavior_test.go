@@ -54,17 +54,35 @@ func TestCredentialStealerShape(t *testing.T) {
 	}
 }
 
-func TestEtcPasswdIsLowNotHigh(t *testing.T) {
-	// /etc/passwd read is common in benign code (user lookups); keep it low to
-	// preserve precision.
-	tr := &Trace{Analysis: map[string]Phase{"import": {Files: []FileOp{{Path: "/etc/passwd", Read: true}}}}}
+func TestEtcPasswdIsInfoNotHigh(t *testing.T) {
+	// /etc/passwd and /etc/shadow are read by benign installs in this sandbox
+	// (confirmed by the benign baseline), so they are informational, not a
+	// verdict-driving signal.
+	tr := &Trace{Analysis: map[string]Phase{"import": {Files: []FileOp{
+		{Path: "/etc/passwd", Read: true}, {Path: "/etc/shadow", Read: true},
+	}}}}
 	got := rules(Analyze(verdict.NPM, tr))
-	if got["sensitive-read:etc-passwd"] != verdict.SevLow {
-		t.Fatalf("etc-passwd should be low, got %v", got)
+	if got["sensitive-read:etc-passwd"] != verdict.SevInfo || got["sensitive-read:etc-shadow"] != verdict.SevInfo {
+		t.Fatalf("etc-passwd/shadow should be info, got %v", got)
 	}
 	// A lone /etc/passwd read must NOT trigger the exfil chain.
 	if _, ok := got["exfil-chain"]; ok {
 		t.Fatal("lone /etc/passwd read wrongly triggered exfil-chain")
+	}
+}
+
+func TestBenignPackageManagerNoiseNotFlagged(t *testing.T) {
+	// Reproduce the benign-baseline shape: npm reads ~/.npmrc, the sandbox reads
+	// /etc/passwd+shadow, and npm spawns `sh -c` to run a (harmless) script.
+	// None of this may produce a blocking/quarantining signal.
+	tr := &Trace{Analysis: map[string]Phase{"install": {
+		Files:    []FileOp{{Path: "/root/.npmrc", Read: true}, {Path: "/etc/passwd", Read: true}, {Path: "/etc/shadow", Read: true}},
+		Commands: []Command{{Command: []string{"sh", "-c", "node build.js"}}},
+	}}}
+	for _, s := range Analyze(verdict.NPM, tr) {
+		if s.Severity == verdict.SevHigh || s.Severity == verdict.SevCritical || s.Severity == verdict.SevMedium {
+			t.Fatalf("benign package-manager noise produced an actionable signal: %+v", s)
+		}
 	}
 }
 

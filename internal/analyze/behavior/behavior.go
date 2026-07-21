@@ -94,7 +94,10 @@ func classifySensitiveRead(path string) (class string, rank int) {
 	case home && containsAny(p, "/.ssh/id_", "/.ssh/id_rsa", "/.ssh/id_ed25519", "/.ssh/id_ecdsa"):
 		return "ssh-private-key", sevRank(verdict.SevHigh)
 	case home && strings.HasSuffix(p, "/.npmrc"):
-		return "npm-token", sevRank(verdict.SevHigh)
+		// npm reads ~/.npmrc on every install to get registry auth, so a benign
+		// package trips this too (confirmed by the benign baseline). Record it
+		// but don't let the read alone drive a verdict.
+		return "npm-token", sevRank(verdict.SevInfo)
 	case home && strings.HasSuffix(p, "/.docker/config.json"):
 		return "docker-config", sevRank(verdict.SevHigh)
 	case home && (strings.HasSuffix(p, "/.git-credentials") || strings.HasSuffix(p, "/.gitconfig")):
@@ -106,9 +109,12 @@ func classifySensitiveRead(path string) (class string, rank int) {
 	case home && (strings.HasSuffix(p, "/.env") || strings.Contains(p, "/.env.")):
 		return "dotenv", sevRank(verdict.SevHigh)
 	case p == "/etc/shadow":
-		return "etc-shadow", sevRank(verdict.SevHigh)
+		// The sandbox runs as root and benign pip installs read /etc/shadow and
+		// /etc/passwd during setup (confirmed by the benign baseline), so these
+		// are baseline noise in this environment, not a detection signal.
+		return "etc-shadow", sevRank(verdict.SevInfo)
 	case p == "/etc/passwd":
-		return "etc-passwd", sevRank(verdict.SevLow)
+		return "etc-passwd", sevRank(verdict.SevInfo)
 	case home && (strings.HasSuffix(p, "/.bashrc") || strings.HasSuffix(p, "/.bash_profile") || strings.HasSuffix(p, "/.profile")):
 		return "shell-rc", sevRank(verdict.SevLow)
 	default:
@@ -130,9 +136,11 @@ func classifyCommand(argv []string) (verdict.Severity, string) {
 	if strings.Contains(joined, "169.254.169.254") || strings.Contains(joined, "169.254.170.2") || strings.Contains(joined, "metadata.google") {
 		return verdict.SevCritical, "spawns a process targeting the cloud-metadata endpoint"
 	}
-	for _, tok := range []string{"curl ", "wget ", " nc ", "ncat ", "/dev/tcp", "base64 -d", "base64 --decode", "chmod +x", "bash -c", "sh -c", "powershell", "invoke-expression"} {
+	// Note: plain `sh -c` / `bash -c` is NOT flagged — that is how npm runs every
+	// lifecycle script; the danger is in what the script does, captured below.
+	for _, tok := range []string{"curl ", "wget ", " nc ", "ncat ", "/dev/tcp", "base64 -d", "base64 --decode", "chmod +x", "powershell", "invoke-expression"} {
 		if strings.Contains(joined, tok) {
-			return verdict.SevHigh, "spawns a shell/network/decode process (" + strings.TrimSpace(tok) + ")"
+			return verdict.SevHigh, "spawns a network/decode process (" + strings.TrimSpace(tok) + ")"
 		}
 	}
 	return "", ""
