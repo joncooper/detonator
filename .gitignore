@@ -1,0 +1,15 @@
+# Python build artifacts (tripwire sdist)
+phase0/tripwire-src/dist/
+phase0/tripwire-src/build/
+phase0/tripwire-src/*.egg-info/
+__pycache__/
+*.pyc
+
+# Detonation outputs — never commit behavior logs / samples
+results/
+*.result.json
+tripwire-result.json
+
+# Local env
+.env
+*.pem

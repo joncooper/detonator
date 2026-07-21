@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "confidence", "rationale", "signals"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["allow", "block", "quarantine"],
+      "description": "Admission decision for this package version."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "rationale": {
+      "type": "string",
+      "description": "One-paragraph explanation grounded in the behavior log."
+    },
+    "signals": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Concrete behaviors that drove the verdict, e.g. 'read /etc/passwd', 'TCP connect to 203.0.113.5:80'."
+    }
+  }
+}
