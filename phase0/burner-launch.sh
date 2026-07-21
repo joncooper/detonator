@@ -15,6 +15,16 @@ INSTANCE_TYPE="${INSTANCE_TYPE:-t3.large}"   # 2 vCPU / 8 GB. gVisor uses ptrace
 # reuse an existing EC2 key pair.
 ### ----------------------
 
+# Preflight: confirm credentials resolve before we start creating resources.
+# SSO logins cache under a profile — export AWS_PROFILE so the CLI finds them.
+if ! aws sts get-caller-identity --region "$REGION" >/dev/null 2>&1; then
+  echo "ERROR: no working AWS credentials for region $REGION." >&2
+  echo "If you use SSO, log in and select the profile in this shell, e.g.:" >&2
+  echo "    aws sso login --profile <your-profile>" >&2
+  echo "    export AWS_PROFILE=<your-profile>" >&2
+  exit 1
+fi
+
 STAMP="$(date +%s 2>/dev/null || echo 0)"
 
 # Mint a burner-only SSH key unless the caller supplied one. AWS generates the
