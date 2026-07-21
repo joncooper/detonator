@@ -8,10 +8,30 @@ set -euo pipefail
 
 ### ---- fill these in ----
 REGION="${REGION:-us-east-1}"
-KEY_NAME="${KEY_NAME:?set KEY_NAME to an existing EC2 key pair name in this region}"
 MY_IP="${MY_IP:?set MY_IP to your public IP, e.g. run: curl -s https://checkip.amazonaws.com}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.large}"   # 2 vCPU / 8 GB. gVisor uses ptrace/systrap — no KVM / .metal needed.
+# KEY_NAME is optional: leave it unset and the script mints a dedicated key pair
+# for this burner and writes the private key next to this script. Set it only to
+# reuse an existing EC2 key pair.
 ### ----------------------
+
+STAMP="$(date +%s 2>/dev/null || echo 0)"
+
+# Mint a burner-only SSH key unless the caller supplied one. AWS generates the
+# key pair and hands back the private key, which we save locally (0600). It is
+# torn down with the instance — a throwaway key for a throwaway host.
+MINTED_KEY=0
+if [ -z "${KEY_NAME:-}" ]; then
+  KEY_NAME="detonator-burner-${STAMP}"
+  PEM="$(cd "$(dirname "$0")" && pwd)/${KEY_NAME}.pem"
+  aws ec2 create-key-pair --region "$REGION" --key-name "$KEY_NAME" \
+    --query 'KeyMaterial' --output text > "$PEM"
+  chmod 600 "$PEM"
+  MINTED_KEY=1
+  echo "Key pair:       $KEY_NAME (minted; private key at $PEM)"
+else
+  echo "Key pair:       $KEY_NAME (pre-existing; use your own private key to SSH)"
+fi
 
 # Latest Ubuntu 24.04 LTS AMI via Canonical's public SSM parameter (no hardcoded, region-specific AMI id).
 AMI_ID=$(aws ssm get-parameters --region "$REGION" \
@@ -23,7 +43,7 @@ echo "AMI:            $AMI_ID"
 # needs to pull the Docker image + benign packages; we tighten the *sandbox's* egress
 # to a sinkhole before any live-corpus run (Phase 3), not the host's during Phase 0.
 SG_ID=$(aws ec2 create-security-group --region "$REGION" \
-  --group-name "detonator-burner-sg-$(date +%s 2>/dev/null || echo 0)" \
+  --group-name "detonator-burner-sg-${STAMP}" \
   --description "Detonator burner - SSH from my IP only" \
   --query 'GroupId' --output text)
 aws ec2 authorize-security-group-ingress --region "$REGION" \
@@ -50,13 +70,23 @@ aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
 IP=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 
+# SSH invocation + teardown vary depending on whether we minted the key.
+if [ "$MINTED_KEY" = "1" ]; then
+  SSH_CMD="ssh -i ${PEM} ubuntu@${IP}"
+  KEY_TEARDOWN="aws ec2 delete-key-pair --region ${REGION} --key-name ${KEY_NAME}; rm -f ${PEM}"
+else
+  SSH_CMD="ssh ubuntu@${IP}"
+  KEY_TEARDOWN="# (using your own key pair ${KEY_NAME}; nothing to delete)"
+fi
+
 cat <<EOF
 
   Burner is up.
-    SSH:        ssh ubuntu@${IP}
-    Watch setup: ssh ubuntu@${IP} 'cloud-init status --wait && cat /opt/BURNER_READY'
+    SSH:         ${SSH_CMD}
+    Watch setup: ${SSH_CMD} 'cloud-init status --wait && cat /opt/BURNER_READY'
     Terminate:   aws ec2 terminate-instances --region ${REGION} --instance-ids ${INSTANCE_ID}
                  aws ec2 delete-security-group   --region ${REGION} --group-id ${SG_ID}
+                 ${KEY_TEARDOWN}
 
   Setup takes ~3-5 min (installs Docker + gVisor + package-analysis). Then follow RUNBOOK.md.
 EOF

@@ -9,21 +9,26 @@ Everything runs on a disposable EC2 burner: no IAM role, IMDS disabled, metadata
 ## Prereqs (on your machine)
 
 - AWS CLI configured (`aws sts get-caller-identity` works).
-- An existing EC2 key pair name in your target region.
 - Your public IP: `curl -s https://checkip.amazonaws.com`.
+
+No EC2 key pair needed up front — the launch script mints a dedicated one for
+the burner and writes its private key next to the script (torn down with the
+host). Set `KEY_NAME` only if you want to reuse an existing key pair.
 
 ## 1 — Launch the burner
 
 From the `phase0/` directory (so `burner-setup.sh` is next to the launch script):
 
 ```bash
-export KEY_NAME=your-keypair-name
 export MY_IP=$(curl -s https://checkip.amazonaws.com)
 export REGION=us-east-1            # optional, defaults to us-east-1
 bash burner-launch.sh
 ```
 
-It prints the instance ID, the SSH command, and the exact teardown commands. Setup (Docker + gVisor + package-analysis) runs via cloud-init in ~3–5 min.
+It mints a burner-only SSH key, then prints the instance ID, the ready-to-use
+SSH command (with `-i <key>.pem`), and the exact teardown commands (including
+deleting the minted key). Setup (Docker + gVisor + package-analysis) runs via
+cloud-init in ~3–5 min.
 
 ## 2 — Confirm it's ready
 
@@ -106,8 +111,12 @@ Paste `tripwire-result.json` (or just the sockets/files/commands sections) back 
 ```bash
 aws ec2 terminate-instances --region $REGION --instance-ids <INSTANCE_ID>
 aws ec2 delete-security-group --region $REGION --group-id <SG_ID>
+aws ec2 delete-key-pair       --region $REGION --key-name <KEY_NAME>   # if minted
+rm -f phase0/<KEY_NAME>.pem                                            # if minted
 # or, from on the box:  sudo shutdown -h now   (shutdown-behavior=terminate destroys it)
 ```
+
+The exact teardown commands (with real ids) are printed by `burner-launch.sh`.
 
 ---
 
