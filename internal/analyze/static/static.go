@@ -58,6 +58,42 @@ var (
 	// not an IP mentioned in a comment/docstring, keeping the rule precise.
 	quotedIPv4   = regexp.MustCompile("[\"'`](\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})[\"'`]")
 	netPrimitive = regexp.MustCompile(`(?i)(https?\.request|\.request\s*\(|fetch\s*\(|new\s+WebSocket|net\.(connect|Socket)|socket\.socket|urllib|requests\.(get|post)|\.connect\s*\(|XMLHttpRequest|axios|curl |wget |require\(['"](https?|net|dgram|tls|ws)['"]\))`)
+
+	// --- reverse-shell / RAT source signatures (family: reverse shell / RAT) ---
+	// Tier A: canonical connect-back idioms as literal source text. These strings
+	// are near-absent from benign package source.
+	revShellIdiom = regexp.MustCompile(`(?i)(/dev/(tcp|udp)/|(ba)?sh\s+-i\b[^\n]*(>&|0>&1|>\s*/dev/tcp)|\b(nc|ncat)\b[^\n|]*\s-[ce]\b|mkfifo\b[^\n]*\|\s*(ba)?sh|socat\b[^\n]*(exec|system):)`)
+	// Tier B: language-native socket-to-shell wiring. Fires only on the triple of
+	// a connect-back primitive, a file-descriptor binding, and a shell target in
+	// one file — benign clients open sockets and even spawn shells, but never bind
+	// a socket's fd onto a shell's stdio.
+	revShellConnect = regexp.MustCompile(`(?i)(net\.(connect|Socket)\s*\(|socket\.socket\s*\(|\.connect\s*\()`)
+	revShellBind    = regexp.MustCompile(`(?i)(os\.dup2\s*\(|\bdup2\s*\(|stdio\s*:\s*\[)`)
+	revShellTarget  = regexp.MustCompile(`(?i)(/bin/(ba)?sh|pty\.spawn\s*\(|cmd\.exe)`)
+
+	// --- cryptominer bundled-artifact signatures (family: cryptominer) ---
+	// A literal stratum pool scheme is sufficient on its own (near-zero benign FP).
+	stratumScheme = regexp.MustCompile(`(?i)stratum\+(tcp|ssl)://`)
+	minerBinary   = regexp.MustCompile(`(?i)\b(xmrig|xmr-stak|minerd|cpuminer|cgminer|bfgminer|ethminer|phoenixminer|nbminer|t-rex|lolminer|gminer|teamredminer|ccminer|xmrminer)\b`)
+	minerConfig   = regexp.MustCompile(`(?i)(randomx|cryptonight|--donate-level|--nicehash|--coin\b)`)
+
+	// --- destructive / wiper signatures (family: wiper / destructive) ---
+	// Precision-first: every branch requires a SYSTEM root, a device, a format
+	// verb, or a home-directory reference. Benign build idioms (rm -rf dist /
+	// build / node_modules, fs.rmSync('build'), shutil.rmtree('build')) never
+	// match. Mirrors behavior.go's destructiveCmd, lifted into the static stage.
+	destructiveToken = regexp.MustCompile(`(?is)(rm\s+-[rf]{1,2}[a-z]*\s+(--no-preserve-root|/($|\s|"|'|\*|root|home|etc|usr|var|bin|boot|lib)|~(/|\s|$)|\$HOME)|\bmkfs\b|\bdd\b[^|\n]*of=/dev/|>\s*/dev/sd|\bshred\b[^|\n]*(/dev/|/root|/home)|\b(rmSync|rmdirSync)\s*\([\s\S]{0,80}?(os\.homedir|homedir\s*\(\s*\)|process\.env\.HOME|['"]\s*/\s*['"])|shutil\.rmtree\s*\([\s\S]{0,80}?(expanduser|os\.environ|environ\[|['"]\s*/\s*['"]))`)
+
+	// --- install-time env/credential stealer (family: install-hook env stealer) ---
+	// Bulk serialization of the WHOLE environment — never a single named var. This
+	// is the benign-distinguishing trait: benign code reads process.env.FOO
+	// constantly but essentially never ships the entire env.
+	bulkEnvSerialize = regexp.MustCompile(`(?i)(JSON\.stringify\s*\(\s*process\.env|Object\.(keys|entries|values)\s*\(\s*process\.env|\{\s*\.\.\.process\.env|dict\s*\(\s*os\.environ|os\.environ\.copy\s*\(|json\.dumps\s*\(\s*(dict\s*\(\s*)?os\.environ|str\s*\(\s*(dict\s*\(\s*)?os\.environ)`)
+
+	// scriptFileToken extracts a local script path referenced by an install hook
+	// command (e.g. `node collect.js` -> collect.js), used to escalate a harvest
+	// that runs at install time.
+	scriptFileToken = regexp.MustCompile(`[\w./@-]+\.(?:js|cjs|mjs|ts)`)
 )
 
 // npmInstallScripts flags install lifecycle hooks in package.json. A hook alone
@@ -81,6 +117,12 @@ func npmInstallScripts(u *artifact.Unpacked) []verdict.Signal {
 			continue
 		}
 		switch {
+		case destructiveToken.MatchString(cmd):
+			sigs = append(sigs, verdict.Signal{
+				Stage: "static", Rule: "destructive-payload", Severity: verdict.SevCritical,
+				Description: "install hook '" + hook + "' runs a destructive/wiper command",
+				Evidence:    truncate(cmd, 200),
+			})
 		case dangerToken.MatchString(cmd):
 			sigs = append(sigs, verdict.Signal{
 				Stage: "static", Rule: "npm-install-hook-danger", Severity: verdict.SevCritical,
@@ -114,6 +156,15 @@ func pySetupExecution(u *artifact.Unpacked) []verdict.Signal {
 		if f == nil {
 			continue
 		}
+		// A wiper whose only act is shutil.rmtree('/') or expanduser('~') matches
+		// no pyExecToken but is unambiguously destructive at install time.
+		if destructiveToken.Match(f.Content) {
+			sigs = append(sigs, verdict.Signal{
+				Stage: "static", Rule: "destructive-payload", Severity: verdict.SevCritical,
+				Description: name + " runs a destructive/wiper command at install time",
+				Evidence:    firstMatch(destructiveToken, f.Content),
+			})
+		}
 		if pyExecToken.MatchString(string(f.Content)) {
 			sev := verdict.SevHigh
 			if urlOrIP.MatchString(string(f.Content)) {
@@ -138,6 +189,11 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 	seenExec := false
 	seenEncoded := false
 	seenHardIP := false
+	seenRevShell := false
+	seenMiner := false
+	seenDestructive := false
+	seenEnvExfil := false
+	hookTargets := npmHookTargets(u)
 	for i := range u.Files {
 		f := &u.Files[i]
 		if isBinary(f.Content) {
@@ -211,6 +267,73 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 				})
 				seenSecret = true
 			}
+		}
+
+		// Reverse-shell / RAT payload sitting in ordinary source (family: reverse
+		// shell / RAT). Tier A literal idioms, or Tier B socket-fd-to-shell wiring.
+		// Both shapes are unambiguously malicious, so Critical. Skip test/doc.
+		if !seenRevShell && !isTestOrDoc(f.Path) {
+			if revShellIdiom.Match(content) {
+				sigs = append(sigs, verdict.Signal{
+					Stage: "static", Rule: "reverse-shell-source", Severity: verdict.SevCritical,
+					Description: "source contains a reverse-shell idiom (connect-back to a shell)",
+					Evidence:    f.Path + ": " + firstMatch(revShellIdiom, content),
+				})
+				seenRevShell = true
+			} else if revShellConnect.Match(content) && revShellBind.Match(content) && revShellTarget.Match(content) {
+				sigs = append(sigs, verdict.Signal{
+					Stage: "static", Rule: "reverse-shell-source", Severity: verdict.SevCritical,
+					Description: "source binds a network socket to a shell's stdio (reverse shell)",
+					Evidence:    f.Path + ": " + firstMatch(revShellTarget, content),
+				})
+				seenRevShell = true
+			}
+		}
+
+		// Bundled cryptominer artifact (family: cryptominer). A stratum pool scheme
+		// alone is sufficient; a miner binary name needs a config/algo token to
+		// fire (skipping prose so docs about miners don't trip the binary path).
+		if !seenMiner {
+			if stratumScheme.Match(content) ||
+				(!isTestOrDoc(f.Path) && minerBinary.Match(content) && minerConfig.Match(content)) {
+				sigs = append(sigs, verdict.Signal{
+					Stage: "static", Rule: "cryptominer-artifact", Severity: verdict.SevHigh,
+					Description: "bundles a cryptominer config/artifact (stratum pool / miner binary)",
+					Evidence:    f.Path,
+				})
+				seenMiner = true
+			}
+		}
+
+		// Destructive / wiper payload in ordinary source (family: wiper). High in
+		// general source (may be conditional/time-bombed); the install-hook and
+		// setup.py contexts are graded Critical separately.
+		if !seenDestructive && !isTestOrDoc(f.Path) && baseName(f.Path) != "package.json" &&
+			!isSetupFile(f.Path) && destructiveToken.Match(content) {
+			sigs = append(sigs, verdict.Signal{
+				Stage: "static", Rule: "destructive-payload", Severity: verdict.SevHigh,
+				Description: "source contains a destructive filesystem/disk operation (wiper)",
+				Evidence:    f.Path + ": " + firstMatch(destructiveToken, content),
+			})
+			seenDestructive = true
+		}
+
+		// Bulk environment/credential harvest co-located with a network sink
+		// (family: install-hook env stealer). High by default; Critical when the
+		// harvest runs at install time (an npm hook target, or setup.py).
+		if !seenEnvExfil && !isTestOrDoc(f.Path) &&
+			bulkEnvSerialize.Match(content) && netPrimitive.Match(content) {
+			sev := verdict.SevHigh
+			desc := "serializes the whole environment next to a network sink (env exfil)"
+			if hookTargets[baseName(f.Path)] || isSetupFile(f.Path) {
+				sev = verdict.SevCritical
+				desc = "install-time harvest: serializes the whole environment to a network sink"
+			}
+			sigs = append(sigs, verdict.Signal{
+				Stage: "static", Rule: "install-env-exfil", Severity: sev,
+				Description: desc, Evidence: f.Path + ": " + firstMatch(bulkEnvSerialize, content),
+			})
+			seenEnvExfil = true
 		}
 
 		if looksObfuscated(f) {
@@ -318,6 +441,46 @@ func isTestOrDoc(path string) bool {
 		strings.Contains(p, "_test") || strings.Contains(p, "/tests") ||
 		strings.Contains(p, "example") || strings.Contains(p, "/docs") ||
 		strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".txt") || strings.HasSuffix(p, ".rst")
+}
+
+// npmHookTargets returns the set of local script basenames referenced by npm
+// install lifecycle hooks (e.g. `node collect.js` -> {collect.js}). A harvest
+// living in one of these files runs at install time and is escalated.
+func npmHookTargets(u *artifact.Unpacked) map[string]bool {
+	targets := map[string]bool{}
+	f := u.Lookup("package.json")
+	if f == nil {
+		return targets
+	}
+	var pkg struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if json.Unmarshal(f.Content, &pkg) != nil {
+		return targets
+	}
+	for _, hook := range []string{"preinstall", "install", "postinstall"} {
+		cmd, ok := pkg.Scripts[hook]
+		if !ok {
+			continue
+		}
+		for _, m := range scriptFileToken.FindAllString(cmd, -1) {
+			targets[baseName(m)] = true
+		}
+	}
+	return targets
+}
+
+// isSetupFile reports whether a path is a Python install-time setup script.
+func isSetupFile(path string) bool {
+	b := baseName(strings.ToLower(path))
+	return b == "setup.py" || b == "setup.cfg"
+}
+
+func baseName(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 // isSBOM reports whether a path is a Software Bill of Materials manifest
