@@ -125,12 +125,15 @@ func TestReverseShellAndDestruction(t *testing.T) {
 }
 
 func TestDropAndExecute(t *testing.T) {
+	// The dropped file is written AND read (write-then-read-to-exec), exactly as
+	// the sandbox records it — file ops must be handled independently, not as a
+	// mutually-exclusive switch.
 	tr := &Trace{Analysis: map[string]Phase{"install": {
-		Files:    []FileOp{{Path: "/tmp/stage2", Write: true}},
-		Commands: []Command{{Command: []string{"sh", "-c", "/tmp/stage2"}}},
+		Files:    []FileOp{{Path: "/tmp/stage2.sh", Read: true, Write: true}},
+		Commands: []Command{{Command: []string{"sh", "/tmp/stage2.sh"}}},
 	}}}
 	if rules(Analyze(verdict.NPM, tr))["download-and-execute"] != verdict.SevCritical {
-		t.Fatal("drop-and-execute not flagged")
+		t.Fatal("drop-and-execute not flagged (read+write dropped file)")
 	}
 }
 

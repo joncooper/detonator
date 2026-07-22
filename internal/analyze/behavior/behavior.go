@@ -28,8 +28,9 @@ func Analyze(eco verdict.Ecosystem, tr *Trace) []verdict.Signal {
 
 	for phase, p := range tr.Analysis {
 		for _, f := range p.Files {
-			switch {
-			case f.Read:
+			// A file can be read AND written AND deleted in one run (a dropper
+			// writes then reads-to-exec), so these are independent, not a switch.
+			if f.Read {
 				if class, sev := classifySensitiveRead(f.Path); class != "" {
 					if sev >= sevRank(verdict.SevHigh) {
 						sawCredentialRead = true
@@ -39,7 +40,8 @@ func Analyze(eco verdict.Ecosystem, tr *Trace) []verdict.Signal {
 						Description: "reads " + class + " during " + phase, Evidence: f.Path,
 					})
 				}
-			case f.Write:
+			}
+			if f.Write {
 				if rule, sev, desc := classifyWrite(f.Path); rule != "" {
 					sigs = append(sigs, verdict.Signal{
 						Stage: "behavior", Rule: rule, Severity: sev,
@@ -49,7 +51,8 @@ func Analyze(eco verdict.Ecosystem, tr *Trace) []verdict.Signal {
 				if looksExecutablePath(f.Path) {
 					writtenExec[baseName(f.Path)] = true
 				}
-			case f.Delete:
+			}
+			if f.Delete {
 				deleted = append(deleted, f.Path)
 			}
 		}
