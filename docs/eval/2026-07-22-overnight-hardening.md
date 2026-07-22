@@ -81,3 +81,25 @@ and self-contained.
   (never weakened).
 - pillow 12.3.0 — `quarantine → allow` via `dscore` on the real wheel.
 - Benign controls (existing + new single-env-var) — all `allow`.
+
+## Post-workflow verification (independent re-check)
+
+The workflow's own gate ran the benign audit against the *pre-hardening* rules
+and only re-checked the known FP after adding new rules — so it did not catch
+false positives introduced *by* the new rules. An independent re-score of the
+20-package static cohort against the hardened build found **2 regressions**:
+
+- `esbuild` → block, `click` → quarantine, both from **install-env-exfil**.
+  esbuild spreads `{...process.env}` into a subprocess to fetch its platform
+  binary; click reads `dict(os.environ)` locally. The rule only required
+  bulk-env-serialize + a network primitive *anywhere in the file*.
+
+**Fixed** (commit `e6baaa3`): `install-env-exfil` now requires the env
+serialization to be adjacent to a network **send** (a POST/body/data) — the
+actual exfil shape. Env-into-a-POST-body still fires; env spread-to-subprocess
+and local env reads no longer do. Cohort back to **0/22 FP**; env-exfil
+true-positive corpus cases still pass; a precision-guard test was added.
+
+**Lesson for the workflow:** the apply/verify step must re-audit the *full*
+benign cohort against the *new* rules, not just re-check the packages that were
+already false positives.
