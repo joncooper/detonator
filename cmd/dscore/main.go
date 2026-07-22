@@ -14,11 +14,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/joncooper/detonator/internal/analyze/behavior"
-	"github.com/joncooper/detonator/internal/analyze/static"
-	"github.com/joncooper/detonator/internal/artifact"
-	"github.com/joncooper/detonator/internal/cache"
 	"github.com/joncooper/detonator/internal/engine"
+	"github.com/joncooper/detonator/internal/score"
 	"github.com/joncooper/detonator/internal/verdict"
 )
 
@@ -40,33 +37,21 @@ func main() {
 		fmt.Fprintf(os.Stderr, "dscore: read trace: %v\n", err)
 		os.Exit(1)
 	}
-	tr, err := behavior.ParseTrace(traceData)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "dscore: %v\n", err)
-		os.Exit(1)
+
+	in := score.Input{
+		Artifact: verdict.Artifact{Ecosystem: verdict.Ecosystem(*eco), Name: *name, Version: *version},
+		Trace:    traceData,
 	}
-
-	ecosystem := verdict.Ecosystem(*eco)
-	art := verdict.Artifact{Ecosystem: ecosystem, Name: *name, Version: *version}
-
-	var signals []verdict.Signal
-	signals = append(signals, behavior.Analyze(ecosystem, tr)...)
-
 	if *tarball != "" {
 		data, err := os.ReadFile(*tarball)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "dscore: read tarball: %v\n", err)
 			os.Exit(1)
 		}
-		art.Digest = cache.Digest(data)
-		if u, err := artifact.UnpackAuto(ecosystem, data); err == nil {
-			signals = append(signals, static.Analyze(art, u)...)
-		} else {
-			fmt.Fprintf(os.Stderr, "dscore: warn: unpack failed: %v\n", err)
-		}
+		in.Tarball = data
 	}
 
-	v := engine.Decide(art, signals, engine.DefaultPolicy(), "detonation-score")
+	v := score.Score(in, engine.DefaultPolicy())
 	out, _ := json.MarshalIndent(v, "", "  ")
 	fmt.Println(string(out))
 

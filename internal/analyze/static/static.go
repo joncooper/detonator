@@ -46,13 +46,13 @@ var (
 	// dynExecDecoded flags exec/eval/interpreter-`-c` applied to decoded content
 	// (base64/atob/unescape/fromCharCode) — the canonical obfuscated-payload
 	// shape. Benign code rarely executes freshly-decoded bytes.
-	dynExecDecoded = regexp.MustCompile("(?is)(exec\\s*\\(|eval\\s*\\(|[\"'`]\\s*-[ce]\\b)[^\\n;]{0,200}?(b64decode|atob\\s*\\(|unescape\\s*\\(|fromCharCode)")
+	dynExecDecoded = regexp.MustCompile("(?is)(exec\\s*\\(|eval\\s*\\(|new\\s+Function\\s*\\(|[\"'`]\\s*-[ce]\\b)[^\\n;]{0,200}?(b64decode|atob\\s*\\(|unescape\\s*\\(|fromCharCode|Buffer\\.from\\([^)\\n]*base64)")
 
 	// b64Literal finds quoted base64-looking string literals (candidate hidden endpoints).
 	b64Literal = regexp.MustCompile("[\"'`]([A-Za-z0-9+/]{24,}={0,2})[\"'`]")
 
 	ipv4Literal  = regexp.MustCompile(`\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b`)
-	netPrimitive = regexp.MustCompile(`(?i)(https?\.request|fetch\s*\(|new\s+WebSocket|net\.(connect|Socket)|socket\.socket|urllib|requests\.(get|post)|\.connect\s*\(|XMLHttpRequest|axios|curl |wget )`)
+	netPrimitive = regexp.MustCompile(`(?i)(https?\.request|\.request\s*\(|fetch\s*\(|new\s+WebSocket|net\.(connect|Socket)|socket\.socket|urllib|requests\.(get|post)|\.connect\s*\(|XMLHttpRequest|axios|curl |wget |require\(['"](https?|net|dgram|tls|ws)['"]\))`)
 )
 
 // npmInstallScripts flags install lifecycle hooks in package.json. A hook alone
