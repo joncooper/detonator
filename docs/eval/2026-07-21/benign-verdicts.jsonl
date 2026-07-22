@@ -1,0 +1,4 @@
+{"name": "left-pad", "eco": "npm", "tag": "benign", "decision": "allow", "rules": ""}
+{"name": "is-number", "eco": "npm", "tag": "benign", "decision": "allow", "rules": ""}
+{"name": "six", "eco": "pypi", "tag": "benign", "decision": "allow", "rules": ""}
+{"name": "certifi", "eco": "pypi", "tag": "benign", "decision": "allow", "rules": ""}
