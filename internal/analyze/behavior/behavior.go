@@ -10,6 +10,8 @@
 package behavior
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/joncooper/detonator/internal/verdict"
@@ -20,38 +22,66 @@ import (
 func Analyze(eco verdict.Ecosystem, tr *Trace) []verdict.Signal {
 	var sigs []verdict.Signal
 	sawCredentialRead := false
+	writtenExec := map[string]bool{} // basenames of executable-looking dropped files
+	reconTools := map[string]bool{}  // distinct host-profiling tools seen
+	var deleted []string
 
 	for phase, p := range tr.Analysis {
 		for _, f := range p.Files {
-			if !f.Read {
-				continue
-			}
-			if class, sev := classifySensitiveRead(f.Path); class != "" {
-				if sev >= sevRank(verdict.SevHigh) {
-					sawCredentialRead = true
+			switch {
+			case f.Read:
+				if class, sev := classifySensitiveRead(f.Path); class != "" {
+					if sev >= sevRank(verdict.SevHigh) {
+						sawCredentialRead = true
+					}
+					sigs = append(sigs, verdict.Signal{
+						Stage: "behavior", Rule: "sensitive-read:" + class, Severity: sevOf(sev),
+						Description: "reads " + class + " during " + phase, Evidence: f.Path,
+					})
 				}
-				sigs = append(sigs, verdict.Signal{
-					Stage: "behavior", Rule: "sensitive-read:" + class, Severity: sevOf(sev),
-					Description: "reads " + class + " during " + phase,
-					Evidence:    f.Path,
-				})
+			case f.Write:
+				if rule, sev, desc := classifyWrite(f.Path); rule != "" {
+					sigs = append(sigs, verdict.Signal{
+						Stage: "behavior", Rule: rule, Severity: sev,
+						Description: desc + " during " + phase, Evidence: f.Path,
+					})
+				}
+				if looksExecutablePath(f.Path) {
+					writtenExec[baseName(f.Path)] = true
+				}
+			case f.Delete:
+				deleted = append(deleted, f.Path)
 			}
 		}
 		for _, c := range p.Commands {
-			if sev, why := classifyCommand(c.Command); why != "" {
+			if rule, sev, desc := classifyCommand(c.Command); rule != "" {
 				sigs = append(sigs, verdict.Signal{
-					Stage: "behavior", Rule: "process-spawn", Severity: sev,
-					Description: why + " during " + phase,
-					Evidence:    strings.Join(c.Command, " "),
+					Stage: "behavior", Rule: rule, Severity: sev,
+					Description: desc + " during " + phase, Evidence: strings.Join(c.Command, " "),
+				})
+			}
+			if t := reconTool(c.Command); t != "" {
+				reconTools[t] = true
+			}
+			if dropped := spawnsWritten(c.Command, writtenExec); dropped != "" {
+				sigs = append(sigs, verdict.Signal{
+					Stage: "behavior", Rule: "download-and-execute", Severity: verdict.SevCritical,
+					Description: "executes a file it dropped during " + phase, Evidence: dropped,
 				})
 			}
 		}
 		for _, s := range p.Sockets {
-			if isMetadataEndpoint(s.Address) {
+			switch {
+			case isMetadataEndpoint(s.Address):
 				sigs = append(sigs, verdict.Signal{
 					Stage: "behavior", Rule: "cloud-metadata-access", Severity: verdict.SevCritical,
-					Description: "connects to the cloud instance-metadata endpoint during " + phase,
-					Evidence:    s.Address,
+					Description: "connects to the cloud instance-metadata endpoint during " + phase, Evidence: s.Address,
+				})
+			case isMiningPoolPort(s.Port):
+				sigs = append(sigs, verdict.Signal{
+					Stage: "behavior", Rule: "mining-pool-egress", Severity: verdict.SevHigh,
+					Description: "connects to a cryptomining-pool port during " + phase,
+					Evidence:    fmt.Sprintf("%s:%d", s.Address, s.Port),
 				})
 			}
 		}
@@ -60,12 +90,31 @@ func Analyze(eco verdict.Ecosystem, tr *Trace) []verdict.Signal {
 				if isUnknownDomain(eco, q.Hostname) {
 					sigs = append(sigs, verdict.Signal{
 						Stage: "behavior", Rule: "unknown-domain", Severity: verdict.SevHigh,
-						Description: "resolves an unknown external domain during " + phase,
-						Evidence:    q.Hostname,
+						Description: "resolves an unknown external domain during " + phase, Evidence: q.Hostname,
 					})
 				}
 			}
 		}
+	}
+
+	// ---- aggregate signals (cross-file / cross-query) ----
+	if len(deleted) >= destructionThreshold {
+		sigs = append(sigs, verdict.Signal{
+			Stage: "behavior", Rule: "data-destruction", Severity: verdict.SevCritical,
+			Description: fmt.Sprintf("deletes %d files (destructive)", len(deleted)), Evidence: firstN(deleted, 3),
+		})
+	}
+	if len(reconTools) >= reconBurstThreshold {
+		sigs = append(sigs, verdict.Signal{
+			Stage: "behavior", Rule: "recon-burst", Severity: verdict.SevMedium,
+			Description: fmt.Sprintf("host reconnaissance: %d distinct profiling tools", len(reconTools)),
+		})
+	}
+	if host, n := dnsExfilPattern(eco, tr); n >= dnsExfilThreshold {
+		sigs = append(sigs, verdict.Signal{
+			Stage: "behavior", Rule: "dns-exfil", Severity: verdict.SevHigh,
+			Description: fmt.Sprintf("%d encoded-subdomain DNS queries to one parent (exfil pattern)", n), Evidence: host,
+		})
 	}
 
 	// Exfil chain: reading credentials AND reaching an unknown destination is the
@@ -128,22 +177,175 @@ func isHomeScoped(p string) bool {
 	return strings.HasPrefix(p, "/root/") || strings.HasPrefix(p, "/home/")
 }
 
-// classifyCommand flags process spawns that shell out, fetch, or decode — the
-// tools install-stage payloads reach for.
-func classifyCommand(argv []string) (verdict.Severity, string) {
+// classifyCommand classifies a spawned process. Pure native-build invocations
+// (node-gyp/gcc/make) carry no danger tokens, so they naturally return no signal
+// and need no explicit whitelist.
+func classifyCommand(argv []string) (rule string, sev verdict.Severity, desc string) {
 	joined := strings.ToLower(strings.Join(argv, " "))
-	// Metadata theft via curl/wget is the highest-signal spawn.
-	if strings.Contains(joined, "169.254.169.254") || strings.Contains(joined, "169.254.170.2") || strings.Contains(joined, "metadata.google") {
-		return verdict.SevCritical, "spawns a process targeting the cloud-metadata endpoint"
+	switch {
+	case containsAny(joined, "169.254.169.254", "169.254.170.2", "metadata.google"):
+		return "process-spawn", verdict.SevCritical, "spawns a process targeting the cloud-metadata endpoint"
+	case reverseShell.MatchString(joined):
+		return "reverse-shell", verdict.SevCritical, "spawns a reverse/interactive shell"
+	case destructiveCmd.MatchString(joined):
+		return "data-destruction", verdict.SevCritical, "runs a destructive command"
+	case containsAny(joined, "xmrig", "minerd", "stratum+tcp", "cryptonight", "--donate-level"):
+		return "mining-pool-egress", verdict.SevHigh, "runs a cryptominer"
 	}
 	// Note: plain `sh -c` / `bash -c` is NOT flagged — that is how npm runs every
-	// lifecycle script; the danger is in what the script does, captured below.
+	// lifecycle script; the danger is in what the script does.
 	for _, tok := range []string{"curl ", "wget ", " nc ", "ncat ", "/dev/tcp", "base64 -d", "base64 --decode", "chmod +x", "powershell", "invoke-expression"} {
 		if strings.Contains(joined, tok) {
-			return verdict.SevHigh, "spawns a network/decode process (" + strings.TrimSpace(tok) + ")"
+			return "process-spawn", verdict.SevHigh, "spawns a network/decode process (" + strings.TrimSpace(tok) + ")"
 		}
 	}
-	return "", ""
+	return "", "", ""
+}
+
+// ---- new behavioral traits ----
+
+const (
+	destructionThreshold = 25 // file deletes in one run that read as destructive
+	reconBurstThreshold  = 3  // distinct host-profiling tools in one run
+	dnsExfilThreshold    = 3  // encoded-subdomain queries to one parent domain
+)
+
+var (
+	reverseShell   = regexp.MustCompile(`(?i)((ba)?sh\s+-i\b|/dev/tcp/|(nc|ncat)\s+[^|]*-e\b|mkfifo\b[^|]*\|\s*(ba)?sh|socat\b.*exec)`)
+	destructiveCmd = regexp.MustCompile(`(?i)(rm\s+-[rf]{1,2}\s+(/($|\s|root|home|etc|usr|var|bin)|~|\$home)|\bmkfs\b|\bdd\s+if=.*of=/dev/|>\s*/dev/sd)`)
+)
+
+// classifyWrite flags a file write that establishes persistence or overwrites a
+// system binary. A package's own install-dir writes don't match these paths.
+func classifyWrite(path string) (rule string, sev verdict.Severity, desc string) {
+	p := strings.ToLower(path)
+	switch {
+	case containsAny(p, "/etc/cron", "/var/spool/cron", "crontab"),
+		containsAny(p, "/etc/systemd/system/", "/lib/systemd/system/", "/.config/systemd/user/"),
+		strings.HasSuffix(p, "/.ssh/authorized_keys"),
+		strings.Contains(p, "/.config/autostart/"),
+		strings.Contains(p, "/.git/hooks/"),
+		p == "/etc/ld.so.preload",
+		isHomeScoped(p) && hasSuffixAny(p, "/.bashrc", "/.bash_profile", "/.profile", "/.zshrc", "/.zprofile"):
+		return "persistence-write", verdict.SevCritical, "writes a persistence mechanism"
+	case hasPrefixAny(p, "/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/"):
+		return "binary-overwrite", verdict.SevCritical, "overwrites a system binary path"
+	}
+	return "", "", ""
+}
+
+// looksExecutablePath reports whether a written path looks like a dropped
+// payload (in a writable dir, script extension or no extension).
+func looksExecutablePath(path string) bool {
+	p := strings.ToLower(path)
+	if !containsAny(p, "/tmp/", "/dev/shm/", "/var/tmp/") && !isHomeScoped(p) {
+		return false
+	}
+	return hasSuffixAny(p, ".sh", ".py", ".elf", ".bin", ".out") || !strings.Contains(baseName(p), ".")
+}
+
+// spawnsWritten returns the argv token that names a file the package dropped —
+// the download/drop-and-execute pattern.
+func spawnsWritten(argv []string, written map[string]bool) string {
+	for _, a := range argv {
+		if written[baseName(a)] {
+			return a
+		}
+	}
+	return ""
+}
+
+// reconTool returns a normalized host-profiling tool name for a command, or "".
+func reconTool(argv []string) string {
+	j := " " + strings.ToLower(strings.Join(argv, " ")) + " "
+	for tok, name := range map[string]string{
+		" uname ": "uname", " whoami ": "whoami", " hostname ": "hostname",
+		" ifconfig ": "ifconfig", " ip addr": "ip", " printenv ": "env",
+		"/etc/os-release": "os-release", " lscpu ": "lscpu",
+	} {
+		if strings.Contains(j, tok) {
+			return name
+		}
+	}
+	if len(argv) > 0 && strings.EqualFold(strings.TrimSpace(argv[len(argv)-1]), "id") {
+		return "id"
+	}
+	return ""
+}
+
+func isMiningPoolPort(port int) bool {
+	switch port {
+	case 3333, 5555, 7777, 14444, 45700:
+		return true
+	}
+	return false
+}
+
+// dnsExfilPattern counts encoded-looking (long) subdomain queries grouped by
+// parent domain — the DNS-exfil shape — and returns the busiest parent.
+func dnsExfilPattern(eco verdict.Ecosystem, tr *Trace) (string, int) {
+	byParent := map[string]int{}
+	for _, p := range tr.Analysis {
+		for _, d := range p.DNS {
+			for _, q := range d.Queries {
+				h := strings.ToLower(strings.TrimSuffix(q.Hostname, "."))
+				if !isUnknownDomain(eco, h) {
+					continue
+				}
+				parent := parentDomain(h)
+				if len(strings.TrimSuffix(h, "."+parent)) >= 20 {
+					byParent[parent]++
+				}
+			}
+		}
+	}
+	best, n := "", 0
+	for p, c := range byParent {
+		if c > n {
+			best, n = p, c
+		}
+	}
+	return best, n
+}
+
+func parentDomain(h string) string {
+	parts := strings.Split(h, ".")
+	if len(parts) <= 2 {
+		return h
+	}
+	return strings.Join(parts[len(parts)-2:], ".")
+}
+
+func baseName(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
+func firstN(ss []string, n int) string {
+	if len(ss) > n {
+		ss = ss[:n]
+	}
+	return strings.Join(ss, ", ")
+}
+
+func hasSuffixAny(s string, sufs ...string) bool {
+	for _, x := range sufs {
+		if strings.HasSuffix(s, x) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPrefixAny(s string, prefs ...string) bool {
+	for _, x := range prefs {
+		if strings.HasPrefix(s, x) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasUnknownEgress(eco verdict.Ecosystem, tr *Trace) bool {
