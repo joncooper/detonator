@@ -100,6 +100,29 @@ func TestBenignBase64NotFlaggedAsC2(t *testing.T) {
 	}
 }
 
+func TestHardcodedPublicIPEndpoint(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.NPM, Name: "evil", Version: "1.0.0"}
+	// Public IP + network primitive -> flagged (strapi shape).
+	bad := unpacked(map[string]string{
+		"postinstall.js": "const http=require('http');http.request({hostname:'144.31.107.231',port:9999});",
+	})
+	if hasRuleSet(Analyze(art, bad))["hardcoded-ip-endpoint"] != verdict.SevHigh {
+		t.Fatal("public-IP endpoint not flagged")
+	}
+	// Private/loopback/DNS IPs must NOT trip it.
+	ok := unpacked(map[string]string{
+		"index.js": "connect('127.0.0.1');connect('10.0.0.5');dns('8.8.8.8');listen('0.0.0.0');",
+	})
+	if hasRule(Analyze(art, ok), "hardcoded-ip-endpoint") != nil {
+		t.Fatal("private/loopback/DNS IP wrongly flagged")
+	}
+	// A public IP with no network primitive nearby must not trip it.
+	noNet := unpacked(map[string]string{"data.js": "const version='144.31.107.231';"})
+	if hasRule(Analyze(art, noNet), "hardcoded-ip-endpoint") != nil {
+		t.Fatal("public IP without a network primitive wrongly flagged")
+	}
+}
+
 func hasRuleSet(sigs []verdict.Signal) map[string]verdict.Severity {
 	m := map[string]verdict.Severity{}
 	for _, s := range sigs {

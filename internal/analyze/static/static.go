@@ -50,6 +50,9 @@ var (
 
 	// b64Literal finds quoted base64-looking string literals (candidate hidden endpoints).
 	b64Literal = regexp.MustCompile("[\"'`]([A-Za-z0-9+/]{24,}={0,2})[\"'`]")
+
+	ipv4Literal  = regexp.MustCompile(`\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b`)
+	netPrimitive = regexp.MustCompile(`(?i)(https?\.request|fetch\s*\(|new\s+WebSocket|net\.(connect|Socket)|socket\.socket|urllib|requests\.(get|post)|\.connect\s*\(|XMLHttpRequest|axios|curl |wget )`)
 )
 
 // npmInstallScripts flags install lifecycle hooks in package.json. A hook alone
@@ -129,6 +132,7 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 	seenSecret := false
 	seenExec := false
 	seenEncoded := false
+	seenHardIP := false
 	for i := range u.Files {
 		f := &u.Files[i]
 		if isBinary(f.Content) {
@@ -146,6 +150,19 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 				Evidence:    f.Path + ": " + firstMatch(dynExecDecoded, content),
 			})
 			seenExec = true
+		}
+
+		// A public IP literal used alongside a network primitive — a hardcoded
+		// C2 endpoint. Benign packages reach named services, not raw public IPs.
+		if !seenHardIP {
+			if ip, ok := hardcodedPublicEndpoint(content); ok {
+				sigs = append(sigs, verdict.Signal{
+					Stage: "static", Rule: "hardcoded-ip-endpoint", Severity: verdict.SevHigh,
+					Description: "source contacts a hardcoded public IP address",
+					Evidence:    f.Path + ": " + ip,
+				})
+				seenHardIP = true
+			}
 		}
 
 		// Base64 literals that decode to a URL or raw IP — a hidden C2/endpoint.
@@ -259,6 +276,54 @@ func decodedNetworkIndicator(content []byte) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// hardcodedPublicEndpoint returns a public IPv4 literal that appears in a file
+// which also uses a network primitive — a hardcoded C2. Private, loopback,
+// link-local, documentation, and common public-DNS addresses are excluded.
+func hardcodedPublicEndpoint(content []byte) (string, bool) {
+	if !netPrimitive.Match(content) {
+		return "", false
+	}
+	for _, m := range ipv4Literal.FindAllSubmatch(content, 200) {
+		if isPublicIP(m[1], m[2], m[3], m[4]) {
+			return string(m[0]), true
+		}
+	}
+	return "", false
+}
+
+func isPublicIP(ab, bb, cb, db []byte) bool {
+	oct := func(b []byte) int {
+		n := 0
+		for _, c := range b {
+			n = n*10 + int(c-'0')
+		}
+		return n
+	}
+	a, b, c, d := oct(ab), oct(bb), oct(cb), oct(db)
+	for _, o := range []int{a, b, c, d} {
+		if o > 255 {
+			return false
+		}
+	}
+	switch {
+	case a == 10, a == 127, a == 0, a >= 224: // private, loopback, this-network, multicast/reserved
+		return false
+	case a == 172 && b >= 16 && b <= 31:
+		return false
+	case a == 192 && b == 168:
+		return false
+	case a == 169 && b == 254: // link-local (incl. cloud metadata — handled behaviorally)
+		return false
+	case a == 100 && b >= 64 && b <= 127: // CGNAT
+		return false
+	case a == 192 && b == 0 && c == 2, a == 198 && b == 51 && c == 100, a == 203 && b == 0 && c == 113: // TEST-NET docs
+		return false
+	case a == 8 && b == 8 && (c == 8 || c == 4), a == 1 && b == 1 && c == 1 && d == 1: // public DNS
+		return false
+	}
+	return true
 }
 
 // isPrintable reports whether b is mostly printable text (so a coincidental
