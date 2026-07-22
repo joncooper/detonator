@@ -32,7 +32,10 @@ func Analyze(art verdict.Artifact, u *artifact.Unpacked) []verdict.Signal {
 var (
 	// Shell/exec danger tokens that make an install hook or setup script
 	// suspicious rather than routine.
-	dangerToken = regexp.MustCompile(`(?i)\b(curl|wget|/dev/tcp|base64\s+-d|base64\s+--decode|bash\s+-c|sh\s+-c|eval|child_process|chmod\s+\+x|node\s+-e|python[0-9]?\s+-c|powershell|invoke-expression|mshta|certutil)\b`)
+	// Note: bare `node -e` / `python -c` are NOT here — they are dual-use (e.g.
+	// core-js's benign funding postinstall); a malicious inline command still
+	// trips curl/wget/base64/etc. below.
+	dangerToken = regexp.MustCompile(`(?i)(\bcurl\b|\bwget\b|/dev/tcp|base64\s+-d|base64\s+--decode|\|\s*(ba)?sh\b|chmod\s+\+x|\bnc\b|powershell|invoke-expression|mshta|certutil)`)
 
 	// Python build/runtime primitives that indicate code executing at install.
 	pyExecToken = regexp.MustCompile(`(?i)(os\.system|subprocess\.(run|call|popen|check_output|check_call)|socket\.socket|urllib|requests\.(get|post)|\bexec\s*\(|\beval\s*\(|base64\.b64decode|__import__\s*\(|marshal\.loads|compile\s*\()`)
@@ -51,7 +54,9 @@ var (
 	// b64Literal finds quoted base64-looking string literals (candidate hidden endpoints).
 	b64Literal = regexp.MustCompile("[\"'`]([A-Za-z0-9+/]{24,}={0,2})[\"'`]")
 
-	ipv4Literal  = regexp.MustCompile(`\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b`)
+	// quotedIPv4 requires the IP to be a string literal (a connection target),
+	// not an IP mentioned in a comment/docstring, keeping the rule precise.
+	quotedIPv4   = regexp.MustCompile("[\"'`](\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})[\"'`]")
 	netPrimitive = regexp.MustCompile(`(?i)(https?\.request|\.request\s*\(|fetch\s*\(|new\s+WebSocket|net\.(connect|Socket)|socket\.socket|urllib|requests\.(get|post)|\.connect\s*\(|XMLHttpRequest|axios|curl |wget |require\(['"](https?|net|dgram|tls|ws)['"]\))`)
 )
 
@@ -154,7 +159,7 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 
 		// A public IP literal used alongside a network primitive — a hardcoded
 		// C2 endpoint. Benign packages reach named services, not raw public IPs.
-		if !seenHardIP {
+		if !seenHardIP && !isTestOrDoc(f.Path) {
 			if ip, ok := hardcodedPublicEndpoint(content); ok {
 				sigs = append(sigs, verdict.Signal{
 					Stage: "static", Rule: "hardcoded-ip-endpoint", Severity: verdict.SevHigh,
@@ -200,8 +205,11 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		}
 
 		if looksObfuscated(f) {
+			// Minification is ubiquitous in benign packages (dist bundles), so
+			// this alone is informational; dynamic-exec-decoded catches the
+			// malicious form (executing decoded content).
 			sigs = append(sigs, verdict.Signal{
-				Stage: "static", Rule: "obfuscated-blob", Severity: verdict.SevMedium,
+				Stage: "static", Rule: "obfuscated-blob", Severity: verdict.SevInfo,
 				Description: "large minified/obfuscated blob with dynamic-eval markers",
 				Evidence:    f.Path,
 			})
@@ -285,12 +293,22 @@ func hardcodedPublicEndpoint(content []byte) (string, bool) {
 	if !netPrimitive.Match(content) {
 		return "", false
 	}
-	for _, m := range ipv4Literal.FindAllSubmatch(content, 200) {
+	for _, m := range quotedIPv4.FindAllSubmatch(content, 200) {
 		if isPublicIP(m[1], m[2], m[3], m[4]) {
-			return string(m[0]), true
+			return string(m[1]) + "." + string(m[2]) + "." + string(m[3]) + "." + string(m[4]), true
 		}
 	}
 	return "", false
+}
+
+// isTestOrDoc reports whether a path is a test, example, or documentation file,
+// where IP/pattern mentions are not payloads.
+func isTestOrDoc(path string) bool {
+	p := strings.ToLower(path)
+	return strings.Contains(p, "/test") || strings.Contains(p, "test/") ||
+		strings.Contains(p, "_test") || strings.Contains(p, "/tests") ||
+		strings.Contains(p, "example") || strings.Contains(p, "/docs") ||
+		strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".txt") || strings.HasSuffix(p, ".rst")
 }
 
 func isPublicIP(ab, bb, cb, db []byte) bool {
