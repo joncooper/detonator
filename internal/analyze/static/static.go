@@ -143,6 +143,15 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		if isBinary(f.Content) {
 			continue
 		}
+		// SBOM manifests (CycloneDX/SPDX, shipped under .dist-info/sboms/ per
+		// PEP 770) are declarative provenance metadata, never executed. They
+		// routinely embed base64 provenance data — git commit logs, diffs,
+		// pedigree — that decodes to text containing URLs, which is not a
+		// payload. Scanning them as source produces false positives (e.g. a
+		// git-log blob tripping encoded-network-indicator), so skip them.
+		if isSBOM(f.Path) {
+			continue
+		}
 		content := f.Content
 
 		// Dynamic execution of decoded content: exec/eval/interpreter-`-c` over
@@ -309,6 +318,19 @@ func isTestOrDoc(path string) bool {
 		strings.Contains(p, "_test") || strings.Contains(p, "/tests") ||
 		strings.Contains(p, "example") || strings.Contains(p, "/docs") ||
 		strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".txt") || strings.HasSuffix(p, ".rst")
+}
+
+// isSBOM reports whether a path is a Software Bill of Materials manifest
+// (CycloneDX or SPDX). Per PEP 770, Python packages ship these under
+// <dist-info>/sboms/. They are inert metadata describing provenance, so their
+// embedded base64/hex blobs are not code and must not be scanned as source.
+func isSBOM(path string) bool {
+	p := strings.ToLower(path)
+	if strings.Contains(p, "/sboms/") {
+		return true
+	}
+	return strings.HasSuffix(p, ".cdx.json") || strings.HasSuffix(p, ".spdx.json") ||
+		strings.HasSuffix(p, ".spdx") || strings.HasSuffix(p, ".cdx.xml")
 }
 
 func isPublicIP(ab, bb, cb, db []byte) bool {

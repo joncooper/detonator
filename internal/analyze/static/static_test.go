@@ -1,6 +1,7 @@
 package static
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"github.com/joncooper/detonator/internal/artifact"
@@ -120,6 +121,29 @@ func TestHardcodedPublicIPEndpoint(t *testing.T) {
 	noNet := unpacked(map[string]string{"data.js": "const version='144.31.107.231';"})
 	if hasRule(Analyze(art, noNet), "hardcoded-ip-endpoint") != nil {
 		t.Fatal("public IP without a network primitive wrongly flagged")
+	}
+}
+
+func TestSBOMProvenanceNotFlaggedAsC2(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.PyPI, Name: "pillow", Version: "1.0.0"}
+	// A CycloneDX SBOM embeds a base64-encoded git commit log (pedigree/diff
+	// text) that decodes to prose containing a URL. This is inert provenance
+	// metadata, not a payload, and must not trip encoded-network-indicator.
+	// (Reproduces the pillow-12.3.0 false positive.)
+	gitlog := base64.StdEncoding.EncodeToString([]byte(
+		"commit 782a11d6b5b61c6dc21e714950a4af5bf89f023c\nAuthor: dev\nSee http://example.com/patch for details\n"))
+	sbom := `{"components":[{"pedigree":{"commits":[{"diff":{"text":{"content":"` + gitlog + `"}}}]}}]}`
+	u := unpacked(map[string]string{
+		"pillow-1.0.0.dist-info/sboms/pillow-1.0.0.cdx.json": sbom,
+	})
+	if hasRule(Analyze(art, u), "encoded-network-indicator") != nil {
+		t.Fatal("SBOM provenance base64 wrongly flagged as encoded C2")
+	}
+	// Precision guard: the SAME base64 blob in ordinary source still fires, so
+	// the fix only exempts SBOM manifests, not the rule itself.
+	src := unpacked(map[string]string{"pkg/client.py": "U = '" + gitlog + "'\n"})
+	if hasRule(Analyze(art, src), "encoded-network-indicator") == nil {
+		t.Fatal("encoded C2 in source no longer detected (over-broad exemption)")
 	}
 }
 
