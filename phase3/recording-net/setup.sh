@@ -36,6 +36,15 @@ print("registry map:", m)
 PY
 REGIPS=$(python3 -c "import json;print(' '.join(json.load(open('$SINK/registry_ips.json')).values()))")
 
+# Warm the analysis + sandbox image cache BEFORE locking egress. On a fresh
+# burner these images aren't pulled, and once egress is denied `-nopull` can't
+# fetch them. A one-off benign detonation pulls both the docker analysis image
+# and the inner podman sandbox image into /var/lib/containers.
+if ! sudo docker image inspect gcr.io/ossf-malware-analysis/analysis >/dev/null 2>&1; then
+  echo "warming image cache (one benign detonation, egress still open)…"
+  ( cd /opt/package-analysis && sudo scripts/run_analysis.sh -nointeractive -ecosystem npm -package lodash >/tmp/warmup.log 2>&1 ) || true
+fi
+
 # start recorders (idempotent, detached under systemd)
 sudo systemctl reset-failed det-resolver det-sinkhole 2>/dev/null || true
 systemctl is-active --quiet det-resolver || sudo systemd-run --unit=det-resolver --collect python3 /home/ubuntu/resolver.py
