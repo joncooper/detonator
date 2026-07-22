@@ -1,0 +1,1 @@
+{"name":"sim-dns-exfil","version":"1.0.0","description":"HARMLESS behavioral simulator (no payload)","scripts":{"postinstall":"node sim.js"}}
