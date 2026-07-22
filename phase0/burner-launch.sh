@@ -9,7 +9,11 @@ set -euo pipefail
 ### ---- fill these in ----
 REGION="${REGION:-us-east-1}"
 MY_IP="${MY_IP:?set MY_IP to your public IP, e.g. run: curl -s https://checkip.amazonaws.com}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-t3.large}"   # 2 vCPU / 8 GB. gVisor uses ptrace/systrap — no KVM / .metal needed.
+INSTANCE_TYPE="${INSTANCE_TYPE:-c7i.xlarge}"   # 4 vCPU / 8 GB. gVisor uses ptrace/systrap — no KVM / .metal needed.
+# t3.large (2 vCPU) starved sshd during detonation: a single gVisor sandbox pegs the CPU and SSH times out.
+# 4 vCPU keeps the host responsive under a running detonation. NOTE: the dockett-dev account's Standard
+# On-Demand vCPU quota is 16, and the CoworkSpike/Devbox dev boxes already use 12 — so c7i.2xlarge (8) won't
+# fit alongside them. Raise the quota (or stop a dev box) before bumping to 2xlarge.
 # KEY_NAME is optional: leave it unset and the script mints a dedicated key pair
 # for this burner and writes the private key next to this script. Set it only to
 # reuse an existing EC2 key pair.
