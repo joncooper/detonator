@@ -71,6 +71,43 @@ func TestPySetupExecutionWithNetworkIsCritical(t *testing.T) {
 	}
 }
 
+func TestDynamicExecOfDecodedPayload(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.PyPI, Name: "evil", Version: "1.0.0"}
+	// The telnyx-style payload: exec of base64-decoded content, plus a base64
+	// literal that decodes to a hidden C2 URL.
+	c2b64 := "aHR0cDovLzgzLjE0Mi4yMDkuMjAzOjgwODAvaGFuZ3VwLndhdg==" // http://83.142.209.203:8080/hangup.wav
+	u := unpacked(map[string]string{
+		"pkg/client.py": "import base64\nx = base64.b64decode('" + c2b64 + "')\nexec(base64.b64decode(payload))\n",
+	})
+	got := hasRuleSet(Analyze(art, u))
+	if got["dynamic-exec-decoded"] != verdict.SevCritical {
+		t.Fatalf("want critical dynamic-exec-decoded, got %+v", got)
+	}
+	if got["encoded-network-indicator"] != verdict.SevHigh {
+		t.Fatalf("want high encoded-network-indicator, got %+v", got)
+	}
+}
+
+func TestBenignBase64NotFlaggedAsC2(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.NPM, Name: "ok", Version: "1.0.0"}
+	// A base64 blob that decodes to binary (not a URL) must not trip the C2 rule.
+	u := unpacked(map[string]string{
+		"package.json": `{"name":"ok"}`,
+		"data.js":      "const img = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAgAAAA';\n",
+	})
+	if hasRule(Analyze(art, u), "encoded-network-indicator") != nil {
+		t.Fatal("benign base64 wrongly flagged as encoded C2")
+	}
+}
+
+func hasRuleSet(sigs []verdict.Signal) map[string]verdict.Severity {
+	m := map[string]verdict.Severity{}
+	for _, s := range sigs {
+		m[s.Rule] = s.Severity
+	}
+	return m
+}
+
 func TestSecretDetection(t *testing.T) {
 	art := verdict.Artifact{Ecosystem: verdict.NPM, Name: "leaky", Version: "1.0.0"}
 	u := unpacked(map[string]string{

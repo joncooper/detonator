@@ -7,6 +7,7 @@
 package static
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"regexp"
 	"strings"
@@ -41,6 +42,14 @@ var (
 	awsKey        = regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)
 	privateKey    = regexp.MustCompile(`-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----`)
 	genericSecret = regexp.MustCompile(`(?i)(secret|token|api[_-]?key|password|passwd)['"]?\s*[:=]\s*['"][A-Za-z0-9/+_\-]{16,}['"]`)
+
+	// dynExecDecoded flags exec/eval/interpreter-`-c` applied to decoded content
+	// (base64/atob/unescape/fromCharCode) — the canonical obfuscated-payload
+	// shape. Benign code rarely executes freshly-decoded bytes.
+	dynExecDecoded = regexp.MustCompile("(?is)(exec\\s*\\(|eval\\s*\\(|[\"'`]\\s*-[ce]\\b)[^\\n;]{0,200}?(b64decode|atob\\s*\\(|unescape\\s*\\(|fromCharCode)")
+
+	// b64Literal finds quoted base64-looking string literals (candidate hidden endpoints).
+	b64Literal = regexp.MustCompile("[\"'`]([A-Za-z0-9+/]{24,}={0,2})[\"'`]")
 )
 
 // npmInstallScripts flags install lifecycle hooks in package.json. A hook alone
@@ -113,16 +122,43 @@ func pySetupExecution(u *artifact.Unpacked) []verdict.Signal {
 }
 
 // scanContents runs content-level heuristics across every text-ish file:
-// secrets, obfuscation, and executable network references.
+// secrets, obfuscation, dynamic-exec-of-decoded payloads, and encoded network
+// indicators.
 func scanContents(u *artifact.Unpacked) []verdict.Signal {
 	var sigs []verdict.Signal
 	seenSecret := false
+	seenExec := false
+	seenEncoded := false
 	for i := range u.Files {
 		f := &u.Files[i]
 		if isBinary(f.Content) {
 			continue
 		}
 		content := f.Content
+
+		// Dynamic execution of decoded content: exec/eval/interpreter-`-c` over
+		// base64/atob/unescape output. Benign code rarely does this; it is the
+		// canonical obfuscated-payload shape (matches GuardDog's rules).
+		if !seenExec && dynExecDecoded.Match(content) {
+			sigs = append(sigs, verdict.Signal{
+				Stage: "static", Rule: "dynamic-exec-decoded", Severity: verdict.SevCritical,
+				Description: "executes dynamically-decoded code (exec/eval of base64/atob output)",
+				Evidence:    f.Path + ": " + firstMatch(dynExecDecoded, content),
+			})
+			seenExec = true
+		}
+
+		// Base64 literals that decode to a URL or raw IP — a hidden C2/endpoint.
+		if !seenEncoded {
+			if dec, ok := decodedNetworkIndicator(content); ok {
+				sigs = append(sigs, verdict.Signal{
+					Stage: "static", Rule: "encoded-network-indicator", Severity: verdict.SevHigh,
+					Description: "base64 literal decodes to a network endpoint (hidden C2)",
+					Evidence:    f.Path + ": " + truncate(dec, 120),
+				})
+				seenEncoded = true
+			}
+		}
 
 		if !seenSecret {
 			if privateKey.Match(content) {
@@ -202,6 +238,45 @@ func isBinary(b []byte) bool {
 		}
 	}
 	return false
+}
+
+// decodedNetworkIndicator scans base64 string literals, decodes them, and
+// returns the first that decodes to a URL or raw IP — a hidden C2/endpoint.
+// Benign base64 (keys, embedded assets) decodes to binary, not "http://", so
+// this stays precise.
+func decodedNetworkIndicator(content []byte) (string, bool) {
+	for _, m := range b64Literal.FindAllSubmatch(content, 60) {
+		raw := m[1]
+		if len(raw) > 8192 {
+			continue
+		}
+		dec, err := base64.StdEncoding.DecodeString(string(raw))
+		if err != nil || !isPrintable(dec) {
+			continue
+		}
+		if urlOrIP.Match(dec) {
+			return strings.TrimSpace(string(dec)), true
+		}
+	}
+	return "", false
+}
+
+// isPrintable reports whether b is mostly printable text (so a coincidental
+// "http" inside decoded binary doesn't trip the rule).
+func isPrintable(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	printable := 0
+	for _, c := range b {
+		if c == 0 {
+			return false
+		}
+		if c >= 0x20 && c < 0x7f || c == '\n' || c == '\r' || c == '\t' {
+			printable++
+		}
+	}
+	return printable*100/len(b) >= 90
 }
 
 func firstMatch(re *regexp.Regexp, b []byte) string {
