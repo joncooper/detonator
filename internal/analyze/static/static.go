@@ -90,6 +90,13 @@ var (
 	// constantly but essentially never ships the entire env.
 	bulkEnvSerialize = regexp.MustCompile(`(?i)(JSON\.stringify\s*\(\s*process\.env|Object\.(keys|entries|values)\s*\(\s*process\.env|\{\s*\.\.\.process\.env|dict\s*\(\s*os\.environ|os\.environ\.copy\s*\(|json\.dumps\s*\(\s*(dict\s*\(\s*)?os\.environ|str\s*\(\s*(dict\s*\(\s*)?os\.environ)`)
 
+	// envExfilSend requires the whole-env serialization to be the payload of a
+	// network SEND (a request body/data), not merely co-located with a network
+	// primitive. This is the exfil-distinguishing trait: benign code spreads
+	// {...process.env} into a subprocess (esbuild) or reads dict(os.environ)
+	// locally (click); malware puts the serialized env inside a POST/send/body.
+	envExfilSend = regexp.MustCompile(`(?is)(\.(post|put|send|write|end)\s*\(|\b(body|data|json)\s*[:=]\s*)[^;\n]{0,40}?(JSON\.stringify\s*\(\s*process\.env|\{\s*\.\.\.\s*process\.env|Object\.(keys|entries|values)\s*\(\s*process\.env|(str|json\.dumps)\s*\(\s*(dict\s*\(\s*)?os\.environ|dict\s*\(\s*os\.environ)`)
+
 	// scriptFileToken extracts a local script path referenced by an install hook
 	// command (e.g. `node collect.js` -> collect.js), used to escalate a harvest
 	// that runs at install time.
@@ -321,10 +328,9 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		// Bulk environment/credential harvest co-located with a network sink
 		// (family: install-hook env stealer). High by default; Critical when the
 		// harvest runs at install time (an npm hook target, or setup.py).
-		if !seenEnvExfil && !isTestOrDoc(f.Path) &&
-			bulkEnvSerialize.Match(content) && netPrimitive.Match(content) {
+		if !seenEnvExfil && !isTestOrDoc(f.Path) && envExfilSend.Match(content) {
 			sev := verdict.SevHigh
-			desc := "serializes the whole environment next to a network sink (env exfil)"
+			desc := "serializes the whole environment into a network send (env exfil)"
 			if hookTargets[baseName(f.Path)] || isSetupFile(f.Path) {
 				sev = verdict.SevCritical
 				desc = "install-time harvest: serializes the whole environment to a network sink"
