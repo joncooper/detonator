@@ -154,8 +154,14 @@ func classifySensitiveRead(path string) (class string, rank int) {
 		return "docker-config", sevRank(verdict.SevHigh)
 	case home && (strings.HasSuffix(p, "/.git-credentials") || strings.HasSuffix(p, "/.gitconfig")):
 		return "git-credentials", sevRank(verdict.SevHigh)
-	case home && strings.HasSuffix(p, "/.netrc"):
-		return "netrc", sevRank(verdict.SevHigh)
+	case home && (strings.HasSuffix(p, "/.netrc") || strings.HasSuffix(p, "/_netrc")):
+		// pip reads ~/.netrc for registry auth on every install, so a do-nothing
+		// benign pypi package trips this too (confirmed by a benign-probe detonation:
+		// a setup.py that only calls setup() reads /root/.netrc + /etc/{passwd,shadow}).
+		// Record it but don't let the read alone drive a verdict — same reasoning as
+		// npm-token/etc-passwd. Genuine netrc theft still surfaces via unknown-domain
+		// (fires independently) when the stolen data is exfiltrated.
+		return "netrc", sevRank(verdict.SevInfo)
 	case home && containsAny(p, "/.config/gcloud", "/.azure/", "/.kube/config"):
 		return "cloud-config", sevRank(verdict.SevHigh)
 	case home && (strings.HasSuffix(p, "/.env") || strings.Contains(p, "/.env.")):
