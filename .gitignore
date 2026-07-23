@@ -10,6 +10,13 @@ results/
 *.result.json
 tripwire-result.json
 
+# Raw sinkhole captures & trace dumps hold exfiltrated data (private keys, creds,
+# host recon) grabbed during detonation — never commit them. Keep human-written
+# writeups (*.md) and sanitized verdict summaries (*.jsonl) only.
+*.pcap
+docs/eval/**/*.log
+docs/eval/**/traces/
+
 # Go build output + proxy cache
 /detonator
 /.detonator-cache/
