@@ -27,7 +27,7 @@ func main() {
 	eco := flag.String("ecosystem", "npm", "ecosystem: npm or pypi")
 	name := flag.String("name", "", "package name")
 	version := flag.String("version", "", "package version")
-	triageMode := flag.String("triage", "", "LLM triage stage: '' (off), 'mock' (local, deterministic), or 'codex' (SENDS SOURCE TO OPENAI)")
+	triageMode := flag.String("triage", "", "LLM triage: '' (off), 'mock' (local), 'codex' (single call), or 'panel' (2 reviewers + combiner) — codex/panel SEND SOURCE TO OPENAI")
 	triageModel := flag.String("triage-model", "gpt-5.6-sol", "codex model id (with -triage codex)")
 	triageEffort := flag.String("triage-effort", "medium", "codex reasoning effort: minimal|low|medium|high|xhigh (with -triage codex)")
 	triageSchema := flag.String("triage-schema", "phase0/verdict-schema.json", "path to the triage output schema (with -triage codex)")
@@ -63,28 +63,34 @@ func main() {
 	}
 
 	var model triage.Model
+	var setSink func(func(triage.RawRecord)) // nil for backends without raw capture
 	switch *triageMode {
 	case "", "off":
 	case "mock":
 		model = triage.MockModel{}
 	case "codex":
 		cm := triage.NewCodex(*triageSchema, *triageModel, *triageEffort)
-		if *triageRaw != "" {
-			f, err := os.OpenFile(*triageRaw, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "dscore: open -triage-raw: %v\n", err)
-				os.Exit(1)
-			}
-			defer f.Close()
-			cm.RawSink = func(r triage.RawRecord) {
-				b, _ := json.Marshal(r)
-				f.Write(append(b, '\n'))
-			}
-		}
+		setSink = func(f func(triage.RawRecord)) { cm.RawSink = f }
 		model = cm
+	case "panel":
+		pm := triage.NewPanel(*triageSchema, *triageModel, *triageEffort)
+		setSink = pm.SetRawSink
+		model = pm
 	default:
-		fmt.Fprintf(os.Stderr, "dscore: unknown -triage %q (want mock|codex)\n", *triageMode)
+		fmt.Fprintf(os.Stderr, "dscore: unknown -triage %q (want mock|codex|panel)\n", *triageMode)
 		os.Exit(2)
+	}
+	if *triageRaw != "" && setSink != nil {
+		f, err := os.OpenFile(*triageRaw, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "dscore: open -triage-raw: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		setSink(func(r triage.RawRecord) {
+			b, _ := json.Marshal(r)
+			f.Write(append(b, '\n'))
+		})
 	}
 
 	var v verdict.Verdict

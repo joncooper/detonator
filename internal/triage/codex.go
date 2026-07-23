@@ -75,12 +75,19 @@ func (m *CodexModel) Classify(ctx context.Context, in Input) (Output, error) {
 	if err != nil {
 		return Output{}, err
 	}
-	args := m.args()
-	raw, runErr := m.run(ctx, m.Bin, args, prompt)
+	return m.runPrompt(ctx, in.Artifact, "triage", prompt)
+}
+
+// runPrompt runs codex on a pre-built prompt, parses the structured verdict, and
+// (if RawSink is set) records the full interaction under the given role label
+// (e.g. "triage", "behavior-review", "combiner"). It is the shared invocation used
+// by the single-shot triage and by each stage of the panel.
+func (m *CodexModel) runPrompt(ctx context.Context, art verdict.Artifact, role, prompt string) (Output, error) {
+	raw, runErr := m.run(ctx, m.Bin, m.args(), prompt)
 	out, parseErr := parseOutput(raw)
 	if m.RawSink != nil {
 		rec := RawRecord{
-			Model: m.Name(), Package: in.Artifact.Name, Ecosystem: string(in.Artifact.Ecosystem),
+			Model: m.Name() + "/" + role, Package: art.Name, Ecosystem: string(art.Ecosystem),
 			Prompt: prompt, RawStdout: string(raw), Output: out,
 		}
 		if runErr != nil {
@@ -136,13 +143,22 @@ func buildPrompt(in Input) (string, error) {
 	}
 	var b strings.Builder
 	b.WriteString("You are a software supply-chain malware triage system. Judge ONLY from the evidence below and return the schema.\n\n")
-	b.WriteString("Decision policy:\n")
-	b.WriteString("- allow: the evidence shows no indicator of malicious behavior. A small, simple, or unremarkable package — no suspicious install hooks, no obfuscation, no credential/network access, no dangerous commands — is ALLOW. Absence of exhaustive proof of benignity is NOT a reason to escalate.\n")
-	b.WriteString("- quarantine: a concrete suspicious indicator is present but not conclusive on its own (obfuscated code, an install hook doing something unusual, credential/dotfile reads, an unexpected network endpoint), OR the deterministic rules and the observed behavior clearly disagree.\n")
-	b.WriteString("- block: the evidence shows a clear malicious capability — install-time remote code execution, credential/environment exfiltration, a reverse shell, a destructive command, or a hidden C2.\n\n")
-	b.WriteString("Bias toward precision: a false block or a false quarantine stalls builds and erodes trust. Do NOT escalate merely because evidence is thin or incomplete — escalate only on a positive indicator of malice.\n\nEvidence:\n")
+	b.WriteString(decisionPolicy())
+	b.WriteString("\nEvidence:\n")
 	b.Write([]byte(blob))
 	return b.String(), nil
+}
+
+// decisionPolicy is the precision-first verdict rubric shared by the single-shot
+// triage and every stage of the panel, so the reviewers and the combiner grade on
+// the same scale. Tuned after a live run in which "escalate when evidence is thin"
+// false-positived on benign packages (docs/eval/2026-07-23-phase3-triage-validation.md).
+func decisionPolicy() string {
+	return "Decision policy:\n" +
+		"- allow: the evidence shows no indicator of malicious behavior. A small, simple, or unremarkable package — no suspicious install hooks, no obfuscation, no credential/network access, no dangerous commands — is ALLOW. Absence of exhaustive proof of benignity is NOT a reason to escalate.\n" +
+		"- quarantine: a concrete suspicious indicator is present but not conclusive on its own (obfuscated code, an install hook doing something unusual, credential/dotfile reads, an unexpected network endpoint), OR the deterministic rules and the observed behavior clearly disagree.\n" +
+		"- block: the evidence shows a clear malicious capability — install-time remote code execution, credential/environment exfiltration, a reverse shell, a destructive command, or a hidden C2.\n\n" +
+		"Bias toward precision: a false block or a false quarantine stalls builds and erodes trust. Do NOT escalate merely because evidence is thin or incomplete — escalate only on a positive indicator of malice.\n"
 }
 
 // parseOutput extracts the schema-conforming JSON object from codex stdout.

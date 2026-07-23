@@ -45,7 +45,7 @@ func main() {
 	osvURL := flag.String("osv-url", "https://api.osv.dev", "OSV API base URL")
 	enableOSV := flag.Bool("osv", true, "enable OSV known-vuln lookup")
 	failClosed := flag.Bool("fail-closed", false, "block on uncertainty instead of quarantining for review")
-	triageKind := flag.String("triage", "off", "LLM triage: 'off', 'mock' (local), or 'codex' (sends source to OpenAI)")
+	triageKind := flag.String("triage", "off", "LLM triage: 'off', 'mock' (local), 'codex' (single call), or 'panel' (2 reviewers + combiner; sends source to OpenAI)")
 	triageModel := flag.String("triage-model", "gpt-5.6-sol", "codex model id for triage")
 	triageEffort := flag.String("triage-effort", "medium", "codex reasoning effort: minimal|low|medium|high|xhigh")
 	triageSchema := flag.String("triage-schema", "phase0/verdict-schema.json", "output schema for codex triage")
@@ -145,6 +145,9 @@ func buildModel(kind, modelName, effort, schemaPath string, log *slog.Logger) tr
 	case "codex":
 		log.Warn("triage: codex model ENABLED — package source will be sent to OpenAI", "model", modelName)
 		return triage.NewCodex(schemaPath, modelName, effort)
+	case "panel":
+		log.Warn("triage: codex PANEL ENABLED — package source will be sent to OpenAI (3 calls/pkg: behavior + source reviewers, combiner)", "model", modelName)
+		return triage.NewPanel(schemaPath, modelName, effort)
 	default:
 		log.Warn("unknown triage kind, disabling", "kind", kind)
 		return nil
