@@ -20,27 +20,31 @@ import (
 )
 
 func main() {
-	tracePath := flag.String("trace", "", "path to the detonation behavior log JSON (required)")
-	tarball := flag.String("tarball", "", "path to the package artifact (optional; enables static rules)")
+	tracePath := flag.String("trace", "", "path to the detonation behavior log JSON (enables behavioral rules)")
+	tarball := flag.String("tarball", "", "path to the package artifact (enables static rules)")
 	eco := flag.String("ecosystem", "npm", "ecosystem: npm or pypi")
 	name := flag.String("name", "", "package name")
 	version := flag.String("version", "", "package version")
 	flag.Parse()
 
-	if *tracePath == "" {
-		fmt.Fprintln(os.Stderr, "dscore: -trace is required")
+	// At least one evidence source is required; either may stand alone. Static-only
+	// (-tarball, no -trace) is the offline precision-gate path; trace-only is the
+	// detonation path.
+	if *tracePath == "" && *tarball == "" {
+		fmt.Fprintln(os.Stderr, "dscore: need -trace and/or -tarball")
 		os.Exit(2)
-	}
-
-	traceData, err := os.ReadFile(*tracePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "dscore: read trace: %v\n", err)
-		os.Exit(1)
 	}
 
 	in := score.Input{
 		Artifact: verdict.Artifact{Ecosystem: verdict.Ecosystem(*eco), Name: *name, Version: *version},
-		Trace:    traceData,
+	}
+	if *tracePath != "" {
+		data, err := os.ReadFile(*tracePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "dscore: read trace: %v\n", err)
+			os.Exit(1)
+		}
+		in.Trace = data
 	}
 	if *tarball != "" {
 		data, err := os.ReadFile(*tarball)

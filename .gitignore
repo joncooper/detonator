@@ -19,6 +19,7 @@ docs/eval/**/traces/
 
 # Go build output + proxy cache
 /detonator
+/dscore
 /.detonator-cache/
 
 # Local env

