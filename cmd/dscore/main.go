@@ -28,8 +28,10 @@ func main() {
 	name := flag.String("name", "", "package name")
 	version := flag.String("version", "", "package version")
 	triageMode := flag.String("triage", "", "LLM triage stage: '' (off), 'mock' (local, deterministic), or 'codex' (SENDS SOURCE TO OPENAI)")
-	triageModel := flag.String("triage-model", "gpt-5.6-sol-medium", "codex model name (with -triage codex)")
+	triageModel := flag.String("triage-model", "gpt-5.6-sol", "codex model id (with -triage codex)")
+	triageEffort := flag.String("triage-effort", "medium", "codex reasoning effort: minimal|low|medium|high|xhigh (with -triage codex)")
 	triageSchema := flag.String("triage-schema", "phase0/verdict-schema.json", "path to the triage output schema (with -triage codex)")
+	triageRaw := flag.String("triage-raw", "", "append the raw codex interaction (prompt + response) to this JSONL file, for offline analysis")
 	flag.Parse()
 
 	// At least one evidence source is required; either may stand alone. Static-only
@@ -66,7 +68,20 @@ func main() {
 	case "mock":
 		model = triage.MockModel{}
 	case "codex":
-		model = triage.NewCodex(*triageSchema, *triageModel)
+		cm := triage.NewCodex(*triageSchema, *triageModel, *triageEffort)
+		if *triageRaw != "" {
+			f, err := os.OpenFile(*triageRaw, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "dscore: open -triage-raw: %v\n", err)
+				os.Exit(1)
+			}
+			defer f.Close()
+			cm.RawSink = func(r triage.RawRecord) {
+				b, _ := json.Marshal(r)
+				f.Write(append(b, '\n'))
+			}
+		}
+		model = cm
 	default:
 		fmt.Fprintf(os.Stderr, "dscore: unknown -triage %q (want mock|codex)\n", *triageMode)
 		os.Exit(2)

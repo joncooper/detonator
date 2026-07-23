@@ -35,7 +35,7 @@ func TestMockModelReactsToBehaviorLog(t *testing.T) {
 }
 
 func TestCodexArgsAndParsing(t *testing.T) {
-	m := NewCodex("phase0/verdict-schema.json", "gpt-5.6-sol-medium")
+	m := NewCodex("phase0/verdict-schema.json", "gpt-5.6-sol", "medium")
 	var gotArgs []string
 	var gotStdin string
 	// Inject a fake runner: no codex process, no network.
@@ -56,7 +56,7 @@ func TestCodexArgsAndParsing(t *testing.T) {
 	}
 
 	joined := strings.Join(gotArgs, " ")
-	for _, want := range []string{"exec", "--output-schema phase0/verdict-schema.json", "--ask-for-approval never", "--sandbox read-only", "--model gpt-5.6-sol-medium"} {
+	for _, want := range []string{"exec", "--output-schema phase0/verdict-schema.json", "--sandbox read-only", "--skip-git-repo-check", "--model gpt-5.6-sol", `-c model_reasoning_effort="medium"`} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("codex args missing %q: %v", want, gotArgs)
 		}
@@ -70,7 +70,7 @@ func TestCodexArgsAndParsing(t *testing.T) {
 }
 
 func TestCodexRejectsInvalidVerdict(t *testing.T) {
-	m := NewCodex("s.json", "")
+	m := NewCodex("s.json", "", "")
 	m.run = func(_ context.Context, _ string, _ []string, _ string) ([]byte, error) {
 		return []byte(`{"verdict":"maybe","confidence":0.5,"rationale":"x","signals":[]}`), nil
 	}

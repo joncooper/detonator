@@ -46,7 +46,8 @@ func main() {
 	enableOSV := flag.Bool("osv", true, "enable OSV known-vuln lookup")
 	failClosed := flag.Bool("fail-closed", false, "block on uncertainty instead of quarantining for review")
 	triageKind := flag.String("triage", "off", "LLM triage: 'off', 'mock' (local), or 'codex' (sends source to OpenAI)")
-	triageModel := flag.String("triage-model", "gpt-5.6-sol-medium", "codex model tier for triage")
+	triageModel := flag.String("triage-model", "gpt-5.6-sol", "codex model id for triage")
+	triageEffort := flag.String("triage-effort", "medium", "codex reasoning effort: minimal|low|medium|high|xhigh")
 	triageSchema := flag.String("triage-schema", "phase0/verdict-schema.json", "output schema for codex triage")
 	doSign := flag.Bool("sign", true, "sign cached verdicts so they can't be forged")
 	signingKey := flag.String("signing-key", "", "path to ed25519 signing key (default: <cache-dir>/signing-key)")
@@ -79,7 +80,7 @@ func main() {
 		log.Info("verdict signing enabled", "key_id", signer.KeyID(), "alg", signer.Algorithm())
 	}
 
-	model := buildModel(*triageKind, *triageModel, *triageSchema, log)
+	model := buildModel(*triageKind, *triageModel, *triageEffort, *triageSchema, log)
 	g := buildGate(*gateKind, c, *osvURL, *enableOSV, *failClosed, model, log)
 	srv := proxy.New(cfg, c, g, log)
 	httpSrv := &http.Server{
@@ -134,7 +135,7 @@ func buildGate(kind string, c *cache.Cache, osvURL string, enableOSV, failClosed
 
 // buildModel constructs the triage model selected on the command line. The
 // codex path sends package source to a third party, so it is opt-in and warns.
-func buildModel(kind, modelName, schemaPath string, log *slog.Logger) triage.Model {
+func buildModel(kind, modelName, effort, schemaPath string, log *slog.Logger) triage.Model {
 	switch kind {
 	case "off", "":
 		return nil
@@ -143,7 +144,7 @@ func buildModel(kind, modelName, schemaPath string, log *slog.Logger) triage.Mod
 		return triage.MockModel{}
 	case "codex":
 		log.Warn("triage: codex model ENABLED — package source will be sent to OpenAI", "model", modelName)
-		return triage.NewCodex(schemaPath, modelName)
+		return triage.NewCodex(schemaPath, modelName, effort)
 	default:
 		log.Warn("unknown triage kind, disabling", "kind", kind)
 		return nil

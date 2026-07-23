@@ -21,20 +21,41 @@ import (
 type CodexModel struct {
 	Bin        string // codex binary, default "codex"
 	SchemaPath string // path to phase0/verdict-schema.json
-	ModelName  string // e.g. "gpt-5.6-sol-medium"
+	ModelName  string // codex model id, e.g. "gpt-5.6-sol"
+	Effort     string // reasoning effort: "minimal"|"low"|"medium"|"high"|"xhigh" ("" = codex config default)
+	// RawSink, if set, receives the complete unparsed interaction for every
+	// Classify call — the exact prompt sent and the exact bytes codex returned —
+	// so an eval run can be refined offline without re-invoking the model.
+	RawSink func(RawRecord)
 	// run executes the command and returns stdout. Injectable for tests so the
 	// prompt/args are exercised without invoking codex or making a network call.
 	run runner
 }
 
+// RawRecord is the complete, unparsed triage interaction for one package: the
+// prompt sent to the model and the raw bytes it returned, plus the parsed result.
+// Captured so an eval can be re-analyzed without re-running the (slow, paid) model.
+type RawRecord struct {
+	Model     string `json:"model"`
+	Package   string `json:"package"`
+	Ecosystem string `json:"ecosystem"`
+	Prompt    string `json:"prompt"`
+	RawStdout string `json:"raw_stdout"`
+	Output    Output `json:"output"`
+	Err       string `json:"err,omitempty"`
+}
+
 type runner func(ctx context.Context, bin string, args []string, stdin string) ([]byte, error)
 
 // NewCodex builds a Codex-backed model. schemaPath points at the verdict schema.
-func NewCodex(schemaPath, modelName string) *CodexModel {
+// effort is the reasoning effort (build-plan §7 default: "medium" for GPT-5.6 Sol);
+// "" leaves codex's configured default.
+func NewCodex(schemaPath, modelName, effort string) *CodexModel {
 	return &CodexModel{
 		Bin:        "codex",
 		SchemaPath: schemaPath,
 		ModelName:  modelName,
+		Effort:     effort,
 		run:        execCodex,
 	}
 }
@@ -55,26 +76,44 @@ func (m *CodexModel) Classify(ctx context.Context, in Input) (Output, error) {
 		return Output{}, err
 	}
 	args := m.args()
-	out, err := m.run(ctx, m.Bin, args, prompt)
-	if err != nil {
-		return Output{}, fmt.Errorf("codex: %w", err)
+	raw, runErr := m.run(ctx, m.Bin, args, prompt)
+	out, parseErr := parseOutput(raw)
+	if m.RawSink != nil {
+		rec := RawRecord{
+			Model: m.Name(), Package: in.Artifact.Name, Ecosystem: string(in.Artifact.Ecosystem),
+			Prompt: prompt, RawStdout: string(raw), Output: out,
+		}
+		if runErr != nil {
+			rec.Err = runErr.Error()
+		} else if parseErr != nil {
+			rec.Err = parseErr.Error()
+		}
+		m.RawSink(rec)
 	}
-	return parseOutput(out)
+	if runErr != nil {
+		return Output{}, fmt.Errorf("codex: %w", runErr)
+	}
+	return out, parseErr
 }
 
-// args returns the codex CLI arguments: headless exec, read-only sandbox, no
-// approval prompts, machine-readable schema, chosen model. The trailing "-"
-// tells codex to read the prompt from stdin, so large evidence never hits the
-// argv length limit.
+// args returns the codex CLI arguments: headless exec, read-only sandbox,
+// machine-readable schema, chosen model and reasoning effort. `codex exec` is
+// non-interactive so it never prompts for approval; read-only sandbox bounds any
+// tool use. --skip-git-repo-check lets it run from any working directory. The
+// trailing "-" tells codex to read the prompt from stdin, so large evidence never
+// hits the argv length limit.
 func (m *CodexModel) args() []string {
 	args := []string{
 		"exec",
 		"--output-schema", m.SchemaPath,
-		"--ask-for-approval", "never",
 		"--sandbox", "read-only",
+		"--skip-git-repo-check",
 	}
 	if m.ModelName != "" {
 		args = append(args, "--model", m.ModelName)
+	}
+	if m.Effort != "" {
+		args = append(args, "-c", "model_reasoning_effort=\""+m.Effort+"\"")
 	}
 	return append(args, "-")
 }
