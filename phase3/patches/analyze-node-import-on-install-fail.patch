@@ -1,0 +1,34 @@
+Detonator patch for OpenSSF package-analysis (sandboxes/dynamicanalysis/analyze-node.js).
+
+Problem: install() calls process.exit(1) when `npm install` returns non-zero, which
+aborts the analysis before the `import` phase. rundynamic.go skips subsequent phases
+on failure, so `import` (require(pkg.name), which fires require-time payloads) never
+runs for any package whose install exits non-zero (dep-resolution failures, audit/peer
+warnings). See docs/eval/2026-07-23-phase2-import-coverage-finding.md.
+
+Fix: don't exit on install failure — log and continue so the import phase still runs.
+
+Apply on the burner, then rebuild + load the sandbox image:
+  cd /opt/package-analysis
+  patch -p1 < analyze-node-import-on-install-fail.patch
+  make build/sandbox/dynamic_analysis RELEASE_TAG=latest
+  docker save gcr.io/ossf-malware-analysis/dynamic-analysis:latest -o /tmp/da.tar
+  docker run --rm --privileged -v /var/lib/containers:/var/lib/containers -v /tmp/da.tar:/da.tar \
+    --entrypoint podman gcr.io/ossf-malware-analysis/analysis:latest load -i /da.tar
+  # retag the loaded image to gcr.io/ossf-malware-analysis/dynamic-analysis:latest
+
+--- a/sandboxes/dynamicanalysis/analyze-node.js
++++ b/sandboxes/dynamicanalysis/analyze-node.js
+@@ -27,8 +27,11 @@
+     // Always exit on failure.
+     // Install failing is either an interesting issue, or an opportunity to
+     // improve the analysis.
+-    console.log('Install failed.');
+-    process.exit(1);
++    // Detonator patch: do NOT abort on non-zero npm install. npm exits non-zero
++    // for benign reasons (audit/peer warnings) and for dep-resolution failures, but
++    // the target package is usually still unpacked into node_modules — so continue
++    // so the import phase runs require(pkg.name) and fires any require-time payload.
++    console.log('Install failed (continuing to import phase).');
+   }
+ }
