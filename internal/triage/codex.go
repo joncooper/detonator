@@ -135,9 +135,12 @@ func buildPrompt(in Input) (string, error) {
 		return "", err
 	}
 	var b strings.Builder
-	b.WriteString("You are a software supply-chain malware triage system. ")
-	b.WriteString("Using ONLY the evidence below, classify this package version and return the schema. ")
-	b.WriteString("Prefer precision: a false block stalls builds. When rules and behavior disagree or evidence is thin, choose quarantine, not allow.\n\nEvidence:\n")
+	b.WriteString("You are a software supply-chain malware triage system. Judge ONLY from the evidence below and return the schema.\n\n")
+	b.WriteString("Decision policy:\n")
+	b.WriteString("- allow: the evidence shows no indicator of malicious behavior. A small, simple, or unremarkable package — no suspicious install hooks, no obfuscation, no credential/network access, no dangerous commands — is ALLOW. Absence of exhaustive proof of benignity is NOT a reason to escalate.\n")
+	b.WriteString("- quarantine: a concrete suspicious indicator is present but not conclusive on its own (obfuscated code, an install hook doing something unusual, credential/dotfile reads, an unexpected network endpoint), OR the deterministic rules and the observed behavior clearly disagree.\n")
+	b.WriteString("- block: the evidence shows a clear malicious capability — install-time remote code execution, credential/environment exfiltration, a reverse shell, a destructive command, or a hidden C2.\n\n")
+	b.WriteString("Bias toward precision: a false block or a false quarantine stalls builds and erodes trust. Do NOT escalate merely because evidence is thin or incomplete — escalate only on a positive indicator of malice.\n\nEvidence:\n")
 	b.Write([]byte(blob))
 	return b.String(), nil
 }
@@ -162,15 +165,46 @@ func validDecision(d verdict.Decision) bool {
 	return d == verdict.Allow || d == verdict.Block || d == verdict.Quarantine
 }
 
-// extractJSONObject returns the last top-level {...} in b, tolerating any log
-// lines codex emits around the final structured message.
+// extractJSONObject returns the last balanced top-level {...} in b, tolerating any
+// log lines codex emits around the final structured message. It tracks string
+// literals and escapes so braces inside string values (e.g. a rationale quoting
+// `{"name":"r"}`) do not break the match — the naive last-brace approach did.
 func extractJSONObject(b []byte) []byte {
-	start := bytes.LastIndexByte(b, '{')
-	end := bytes.LastIndexByte(b, '}')
-	if start < 0 || end < start {
-		return nil
+	var last []byte
+	for i := 0; i < len(b); {
+		if b[i] != '{' {
+			i++
+			continue
+		}
+		depth, inStr, esc := 0, false, false
+		j := i
+		for ; j < len(b); j++ {
+			c := b[j]
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = !inStr
+			case inStr:
+			case c == '{':
+				depth++
+			case c == '}':
+				depth--
+			}
+			if !inStr && !esc && c == '}' && depth == 0 {
+				break
+			}
+		}
+		if depth == 0 && j < len(b) {
+			last = b[i : j+1]
+			i = j + 1
+		} else {
+			i++
+		}
 	}
-	return b[start : end+1]
+	return last
 }
 
 func execCodex(ctx context.Context, bin string, args []string, stdin string) ([]byte, error) {

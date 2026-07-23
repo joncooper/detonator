@@ -69,6 +69,19 @@ func TestCodexArgsAndParsing(t *testing.T) {
 	}
 }
 
+func TestParseOutputBracesInString(t *testing.T) {
+	// codex's rationale/signals routinely quote JSON like {"name":"r"}; the extractor
+	// must not treat those inner braces as the object boundary.
+	raw := []byte("log line\n{\"verdict\":\"block\",\"confidence\":0.9,\"rationale\":\"manifest is only {\\\"name\\\":\\\"r\\\"}\",\"signals\":[\"references {\\\"x\\\":1}\"]}\n")
+	out, err := parseOutput(raw)
+	if err != nil {
+		t.Fatalf("parseOutput with braces-in-string: %v", err)
+	}
+	if out.Decision != verdict.Block || out.Confidence != 0.9 {
+		t.Fatalf("wrong parse: %+v", out)
+	}
+}
+
 func TestCodexRejectsInvalidVerdict(t *testing.T) {
 	m := NewCodex("s.json", "", "")
 	m.run = func(_ context.Context, _ string, _ []string, _ string) ([]byte, error) {
