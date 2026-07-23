@@ -9,6 +9,7 @@ package triage
 import (
 	"context"
 
+	"github.com/joncooper/detonator/internal/artifact"
 	"github.com/joncooper/detonator/internal/verdict"
 )
 
@@ -59,6 +60,35 @@ func (o Output) ToSignal(modelName string) verdict.Signal {
 		Description: modelName + " triage: " + o.Rationale,
 		Evidence:    joinSignals(o.Signals),
 	}
+}
+
+// SelectExcerpts returns a small, bounded set of the files most worth a model's
+// attention — install/build scripts and entry points — never the whole package.
+// Shared by the live gate and the offline scorer so both feed the model the same
+// evidence.
+func SelectExcerpts(u *artifact.Unpacked) map[string]string {
+	if u == nil {
+		return nil
+	}
+	const maxFiles, maxBytes = 6, 8 << 10
+	interesting := []string{
+		"package.json", "setup.py", "setup.cfg", "pyproject.toml",
+		"index.js", "main.js", "__init__.py",
+	}
+	out := map[string]string{}
+	for _, name := range interesting {
+		if len(out) >= maxFiles {
+			break
+		}
+		if f := u.Lookup(name); f != nil {
+			c := f.Content
+			if len(c) > maxBytes {
+				c = c[:maxBytes]
+			}
+			out[name] = string(c)
+		}
+	}
+	return out
 }
 
 func joinSignals(ss []string) string {

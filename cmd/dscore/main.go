@@ -9,6 +9,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/joncooper/detonator/internal/engine"
 	"github.com/joncooper/detonator/internal/score"
+	"github.com/joncooper/detonator/internal/triage"
 	"github.com/joncooper/detonator/internal/verdict"
 )
 
@@ -25,6 +27,9 @@ func main() {
 	eco := flag.String("ecosystem", "npm", "ecosystem: npm or pypi")
 	name := flag.String("name", "", "package name")
 	version := flag.String("version", "", "package version")
+	triageMode := flag.String("triage", "", "LLM triage stage: '' (off), 'mock' (local, deterministic), or 'codex' (SENDS SOURCE TO OPENAI)")
+	triageModel := flag.String("triage-model", "gpt-5.6-sol-medium", "codex model name (with -triage codex)")
+	triageSchema := flag.String("triage-schema", "phase0/verdict-schema.json", "path to the triage output schema (with -triage codex)")
 	flag.Parse()
 
 	// At least one evidence source is required; either may stand alone. Static-only
@@ -55,7 +60,24 @@ func main() {
 		in.Tarball = data
 	}
 
-	v := score.Score(in, engine.DefaultPolicy())
+	var model triage.Model
+	switch *triageMode {
+	case "", "off":
+	case "mock":
+		model = triage.MockModel{}
+	case "codex":
+		model = triage.NewCodex(*triageSchema, *triageModel)
+	default:
+		fmt.Fprintf(os.Stderr, "dscore: unknown -triage %q (want mock|codex)\n", *triageMode)
+		os.Exit(2)
+	}
+
+	var v verdict.Verdict
+	if model != nil {
+		v = score.ScoreTriage(context.Background(), in, engine.DefaultPolicy(), model)
+	} else {
+		v = score.Score(in, engine.DefaultPolicy())
+	}
 	out, _ := json.MarshalIndent(v, "", "  ")
 	fmt.Println(string(out))
 

@@ -105,7 +105,7 @@ func (p *Pipeline) triageSignals(ctx context.Context, art verdict.Artifact, detS
 		Artifact:       art,
 		StaticSignals:  detSignals,
 		Diff:           diff,
-		SourceExcerpts: selectExcerpts(u),
+		SourceExcerpts: triage.SelectExcerpts(u),
 	}
 	out, err := p.model.Classify(ctx, in)
 	if err != nil {
@@ -130,33 +130,6 @@ func (p *Pipeline) triageSignals(ctx context.Context, art verdict.Artifact, detS
 
 // clears reports whether a decision would admit the package.
 func clears(d verdict.Decision) bool { return d == verdict.Allow }
-
-// selectExcerpts returns a small, bounded set of the files most worth a model's
-// attention — install/build scripts and entry points — never the whole package.
-func selectExcerpts(u *artifact.Unpacked) map[string]string {
-	if u == nil {
-		return nil
-	}
-	const maxFiles, maxBytes = 6, 8 << 10
-	interesting := []string{
-		"package.json", "setup.py", "setup.cfg", "pyproject.toml",
-		"index.js", "main.js", "__init__.py",
-	}
-	out := map[string]string{}
-	for _, name := range interesting {
-		if len(out) >= maxFiles {
-			break
-		}
-		if f := u.Lookup(name); f != nil {
-			c := f.Content
-			if len(c) > maxBytes {
-				c = c[:maxBytes]
-			}
-			out[name] = string(c)
-		}
-	}
-	return out
-}
 
 // previousGood returns the unpacked bytes of the most recent prior version that
 // was allowed, to diff the candidate against. History is appended after each
