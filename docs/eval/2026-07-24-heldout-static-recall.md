@@ -101,12 +101,20 @@ most-downloaded npm + pypi packages (real, benign), static-only.
     substrings in frontend chunks hard-BLOCKED streamlit + google-adk); PKG-INFO/egg-info
     metadata prose.
 
-After the pass, **the 3 new rules are 0 FP**, and the pypi residual is a handful of
-genuine hard edges — setup.py legitimately fetching at build (reportlab, statsmodels,
-vcrpy), a reverse-shell *example* in a serial library (pyserial), a Dockerfile-generating
-`.py` (swesmith), a wiper inside a test file (python-gnupg). These are documented, not
-fixed: distinguishing them needs semantic context, and forcing them to `allow` risks
-real recall. No real C2/wiper hides the way the fixed classes do, so recall is unaffected.
+After the pass, **the 3 new rules are 0 FP across the full top-1500 npm + pypi**, and the
+pypi residual is **9 / 1421 (~0.6%), all pre-existing rules** — genuine hard edges:
+setup.py legitimately fetching at build (reportlab, statsmodels, vcrpy), a reverse-shell
+*example* in a serial library (pyserial), a Dockerfile-generating `.py` (swesmith), a
+wiper inside a test file (python-gnupg), a base64-URL in ansible-core, destructive build
+steps in pep517 / openhands-sdk. These are documented, not fixed: distinguishing them
+needs semantic context, and forcing them to `allow` risks real recall. No real C2/wiper
+hides the way the fixed classes do, so recall is unaffected.
+
+Two of the fixes were on the new rules themselves — `magika`'s hex-offset field names
+(`offset_0x8000`) tripping the `_0x` fingerprint, and `re.compile("\x89…")` over
+magic-byte signatures reading as escape-obfuscation. Both are the precision-at-scale
+loop working as intended: a rule that looks clean on 30 packages meets its FP class at
+1500 and gets tightened.
 
 ## Honest limits
 
