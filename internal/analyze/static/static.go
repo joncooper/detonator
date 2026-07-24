@@ -804,6 +804,8 @@ func isPublicIP(ab, bb, cb, db []byte) bool {
 		return false
 	case a == 8 && b == 8 && (c == 8 || c == 4), a == 1 && b == 1 && c == 1 && d == 1: // public DNS
 		return false
+	case a == 1 && b == 2 && c == 3 && d == 4: // the universal placeholder/example IP (docstrings, tests)
+		return false
 	}
 	return true
 }
