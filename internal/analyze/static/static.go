@@ -126,7 +126,10 @@ var (
 	// webpack) rename to short alphanumerics (a, e, _t, $), never _0x-hex, so a
 	// dense cluster of these is a precise obfuscation signal — distinct from
 	// ordinary minification, which stays informational.
-	hexIdent = regexp.MustCompile(`_0x[0-9a-fA-F]{4,}`)
+	// \b anchors _0x to an identifier start: javascript-obfuscator emits standalone
+	// `_0x1a2b` names (preceded by space/operator/paren), never `offset_0x8000` — a
+	// hex memory-offset field (magika ships 8 of these and tripped the fingerprint).
+	hexIdent = regexp.MustCompile(`\b_0x[0-9a-fA-F]{4,}`)
 
 	// --- host/identity reconnaissance (family: recon exfil) ---
 	// Identity primitives that answer "who/where am I". Deliberately excludes the
@@ -142,12 +145,16 @@ var (
 	// eval()s an escape-encoded string, so this is a near-zero-FP fingerprint. The
 	// JS `_0x` detector (hexObfuscated) does not cover it; without it the whole
 	// BlankOBF stealer family (keyauthkey, axelo, robloxlogger, …) scores allow.
-	pyEscEval = regexp.MustCompile(`(?i)(eval|exec|compile)\s*\(\s*["'](\\x[0-9a-f]{2}|\\[0-3][0-7]{2}){2,}`)
+	// eval/exec only — NOT compile: re.compile("\x89\x50…") on magic-byte signatures
+	// is benign (magika, binary parsers), while eval/exec of an escaped string is the
+	// BlankOBF execution signature. \b avoids matching inside an identifier (myeval().
+	pyEscEval = regexp.MustCompile(`(?i)\b(eval|exec)\s*\(\s*["'](\\x[0-9a-f]{2}|\\[0-3][0-7]{2}){2,}`)
 	// escSeq counts backslash byte-escapes; pyDynExec is a dynamic-code primitive.
 	// A file dominated by escape bytes AND calling one is an encoded blob even when
-	// the eval is one indirection removed from the literal.
+	// the eval is one indirection removed from the literal. compile is excluded for
+	// the same reason: re.compile over byte patterns is not code execution.
 	escSeq    = regexp.MustCompile(`\\x[0-9a-fA-F]{2}|\\[0-3][0-7]{2}`)
-	pyDynExec = regexp.MustCompile(`(?i)\b(eval|exec|compile|marshal\.loads|__import__)\s*\(`)
+	pyDynExec = regexp.MustCompile(`(?i)\b(eval|exec|marshal\.loads|__import__)\s*\(`)
 
 	// --- shell reconnaissance/exfil in an exec'd command (family: recon exfil) ---
 	// shellRecon: identity/credential recon expressed as shell (distinct from the

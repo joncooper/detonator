@@ -299,6 +299,17 @@ func TestObfuscatorFingerprint(t *testing.T) {
 	if hasRule(Analyze(art, minified), "obfuscated-code") != nil {
 		t.Fatal("terser-minified bundle wrongly flagged as obfuscated-code")
 	}
+	// Precision: hex-offset FIELD names (offset_0x8000) are not obfuscator identifiers —
+	// the _0x is embedded in a longer name, not standalone (magika ships 8 of these).
+	offsets := unpacked(map[string]string{"magika.py": "cfg=dict(offset_0x8000=[],offset_0x8007=[],offset_0x8800=[],offset_0x8807=[],offset_0x9000=[],offset_0x9007=[],offset_0x9800=[],offset_0x9807=[])"})
+	if hasRule(Analyze(verdict.Artifact{Ecosystem: verdict.PyPI}, offsets), "obfuscated-code") != nil {
+		t.Fatal("hex-offset field names (offset_0x8000) wrongly flagged as obfuscated-code")
+	}
+	// Precision: re.compile over magic-byte signatures is not eval/exec obfuscation.
+	recompile := unpacked(map[string]string{"sig.py": `import re` + "\n" + `PNG=re.compile("\x89\x50\x4e\x47\x0d\x0a\x1a\x0a")` + "\n" + `JPG=re.compile("\xff\xd8\xff")`})
+	if hasRule(Analyze(verdict.Artifact{Ecosystem: verdict.PyPI}, recompile), "obfuscated-code") != nil {
+		t.Fatal("re.compile over byte signatures wrongly flagged as obfuscated-code")
+	}
 }
 
 func TestHostReconExfil(t *testing.T) {
