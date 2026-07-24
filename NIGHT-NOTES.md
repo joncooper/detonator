@@ -5,6 +5,26 @@ cohort" push. Headline: **a real held-out eval now exists**, static recall went
 **45% → 53% and the lift generalizes**, and the detector is precision-hardened at scale.
 Everything below is committed to `main`. Burner teardown status at the bottom.
 
+## Morning addendum — export fuzzing (`docs/eval/2026-07-24-export-fuzzing.md`)
+
+You flagged that runtime-fetch and self-de-obfuscating payloads *should* be behaviorally
+visible, and that the "misses" smelled like a coverage gap. Tested it: patched the npm
+import harness to enumerate + invoke a module's exports (function-gated payloads), rebuilt
+the sandbox, and detonated a **205-npm batch** behind the sinkhole, saving every trace.
+
+- **Export fuzzing recovered 1 of 10 residual misses** (`whatsapp-core-auth-drzak`, a
+  domain-C2 beacon). Modest — the hypothesis was partly right.
+- The other 9 are **rule gaps, not function-gating.** The `elf-stats-*` misses are IIFE
+  reverse shells to **raw IPs** — they run on require (fuzzing irrelevant) and the sink
+  *captured the connection*, but static's reverse-shell rule only matches `dup2` (not
+  `.pipe()`) and behavioral's `unknown-domain` is DNS-shaped, so a hardcoded-IP
+  connect-back is invisible. **Two concrete fixes** fall out (static `.pipe()` reverse
+  shells; behavioral raw-IP egress) — both testable against the saved corpus offline.
+- **Corpus saved**: 195 traces + 206 logs → `eval-captures/2026-07-24-export-fuzzing-corpus.tgz`
+  (gitignored). Burner torn down.
+- Serial-only (concurrent detonation hit a gVisor container-creation race); pypi still
+  dep-undercounted. Codex panel still parked.
+
 ## What got done
 
 1. **First real held-out eval** (`docs/eval/2026-07-24-heldout-static-recall.md`).

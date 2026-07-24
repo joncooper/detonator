@@ -25,3 +25,6 @@ docs/eval/**/traces/
 # Local env
 .env
 *.pem
+
+# Detonation trace corpora (malware behavior logs — never commit)
+eval-captures/
