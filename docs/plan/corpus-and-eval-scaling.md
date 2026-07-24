@@ -93,6 +93,23 @@ not an artifact source:
 - **Eval the held-out exactly once per rule-freeze.** Peeking, then re-tuning, invalidates
   it — from then on it's a tune set.
 
+## Sizing (measured)
+
+Cross-referencing the fetchable Datadog artifacts against the Backstabber's name index:
+
+- Datadog unique malicious names: **npm 12,601 + pypi 1,816**.
+- **Datadog ∩ Backstabber's: npm 2,751 + pypi 621 = 3,372** cross-source-confirmed
+  malicious samples with fetchable artifacts. This is the tune + held-out pool.
+
+**Detonation budget is the hard limit.** At ~3 min/sample, 3,372 samples is ~160 hours —
+you cannot detonate the pool. So:
+
+- **Static** — score all 3,372 (fetch on a burner for custody, `dscore -tarball`, fast).
+  This is a real static **recall at scale** number, the complement to precision at scale.
+- **Detonation** — a random sample of ~150–300 (a night's burner budget), for behavioral
+  recall + the panel. Report it as a sample, not the whole pool.
+- **Panel** — the ambiguous subset of the detonated sample only (codex tokens).
+
 ## Order
 
 1. **Precision at scale** (benign top-N) — cheap, unblocks the FP number; fix what it finds.
