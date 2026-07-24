@@ -82,12 +82,31 @@ quarantine (fail-to-review), never an auto-block.
 Locked in by unit tests (`TestPythonEscapeObfuscation`, `TestShellReconExfilInHook`,
 `TestHardcodedWebhookExfil`), each with a precision counter-case.
 
-## Precision guard
+## Precision at scale
 
-The three rules must not buy recall with false positives. Re-scored the top-1500
-most-downloaded npm + pypi packages (real, benign) with v2: **0 flagged** _(final count
-pending cohort completion; 260 scored clean at time of writing)_. Combined with the
-locked precision cases, the v2 rules add recall at no measured precision cost.
+The rules must not buy recall with false positives. Re-scored the top-1500
+most-downloaded npm + pypi packages (real, benign), static-only.
+
+- **npm: 0 flagged / 1500.** Clean.
+- **pypi: 26 flagged / 1421** with the initial v2 rules — **all pre-existing rules
+  except one** (passlib, from the new shell-recon rule). This is the precision-at-scale
+  workstream doing its job: benign scale surfaces FP classes a 30-package cohort never
+  will. Diagnosing them drove a hardening pass (separate commits):
+  - `passlib` (the one new-rule FP): `/etc/shadow` in a description docstring + an
+    unrelated homepage URL. Rewrote shell-recon as a **proximity** match (recon token
+    within 250 chars of a fetch/exec verb), so a real `curl "…$(whoami)…|base64"` beacon
+    still fires but prose does not.
+  - Placeholder IPs (`1.2.3.4`, repeated-octet `12.12.12.12`); Dockerfiles + build/
+    packaging/nix dirs (`rm -rf /var` at image build); minified bundles (`mkfs`/`mkfifo`
+    substrings in frontend chunks hard-BLOCKED streamlit + google-adk); PKG-INFO/egg-info
+    metadata prose.
+
+After the pass, **the 3 new rules are 0 FP**, and the pypi residual is a handful of
+genuine hard edges — setup.py legitimately fetching at build (reportlab, statsmodels,
+vcrpy), a reverse-shell *example* in a serial library (pyserial), a Dockerfile-generating
+`.py` (swesmith), a wiper inside a test file (python-gnupg). These are documented, not
+fixed: distinguishing them needs semantic context, and forcing them to `allow` risks
+real recall. No real C2/wiper hides the way the fixed classes do, so recall is unaffected.
 
 ## Honest limits
 
