@@ -156,8 +156,12 @@ var (
 	// only in install context; a benign install hook never reads /etc/shadow and
 	// pipes it to a remote host. Recovers the postinstall→exec(curl … recon) beacon
 	// family (oast.fun/interactsh collaborators) that hostReconExfil misses.
-	shellRecon = regexp.MustCompile(`(?i)(\$\(\s*(whoami|hostname|id)\s*\)|\bwhoami\b|/etc/(passwd|shadow)\b|\buname\s+-a\b|~/\.ssh/|\.aws/credentials|\.ssh/id_(rsa|ed25519))`)
-	shellExfil = regexp.MustCompile(`(?i)(\bcurl\b|\bwget\b|\bncat?\b|https?://|base64\s+-?w?)`)
+	// shellReconExfilRe: a shell fetch/exec verb within ~250 chars of a host/
+	// credential recon token, in either order — the beacon shape (`curl "…$(whoami)/
+	// $(hostname)… cat /etc/passwd | base64"`). Proximity is the precision key: it
+	// separates an exec'd recon command from "/etc/shadow" merely named in a
+	// description docstring (passlib) or a homepage URL elsewhere in the file.
+	shellReconExfilRe = regexp.MustCompile(`(?is)((?:curl|wget|\bnc\b|\bncat\b|base64\b|exec\s*\(|child_process|os\.system|subprocess).{0,250}?(?:\$\(\s*(?:whoami|hostname|id)|\bwhoami\b|/etc/(?:passwd|shadow)|~/\.ssh/|\.aws/credentials|\.ssh/id_(?:rsa|ed25519))|(?:\$\(\s*(?:whoami|hostname|id)|\bwhoami\b|/etc/(?:passwd|shadow)|~/\.ssh/|\.aws/credentials).{0,250}?(?:curl|wget|\bnc\b|base64\b|\|\s*(?:ba)?sh))`)
 
 	// hardcodedWebhook: a Discord webhook or Telegram bot endpoint carrying a real
 	// id+token — the canonical token/cookie-stealer exfil sink. A full snowflake id
@@ -361,7 +365,7 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		// Reverse-shell / RAT payload sitting in ordinary source (family: reverse
 		// shell / RAT). Tier A literal idioms, or Tier B socket-fd-to-shell wiring.
 		// Both shapes are unambiguously malicious, so Critical. Skip test/doc.
-		if !seenRevShell && !isTestOrDoc(f.Path) && !isVendoredBundle(f.Path) && !isDataConfig(f.Path) {
+		if !seenRevShell && !isTestOrDoc(f.Path) && !isVendoredBundle(f.Path) && !isDataConfig(f.Path) && !isMinified(content) {
 			if revShellIdiom.Match(content) {
 				sigs = append(sigs, verdict.Signal{
 					Stage: "static", Rule: "reverse-shell-source", Severity: verdict.SevCritical,
@@ -398,7 +402,7 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		// general source (may be conditional/time-bombed); the install-hook and
 		// setup.py contexts are graded Critical separately.
 		if !seenDestructive && !isTestOrDoc(f.Path) && !isBuildTooling(f.Path) && !isDataConfig(f.Path) &&
-			!isVendoredBundle(f.Path) && baseName(f.Path) != "package.json" && !isSetupFile(f.Path) && destructiveToken.Match(content) {
+			!isVendoredBundle(f.Path) && !isMinified(content) && baseName(f.Path) != "package.json" && !isSetupFile(f.Path) && destructiveToken.Match(content) {
 			sigs = append(sigs, verdict.Signal{
 				Stage: "static", Rule: "destructive-payload", Severity: verdict.SevHigh,
 				Description: "source contains a destructive filesystem/disk operation (wiper)",
@@ -546,7 +550,7 @@ func pyObfuscated(content []byte) bool {
 // and ships it out — the install-beacon shape hostReconExfil (JS/Python primitives)
 // misses because the recon is expressed as shell inside an exec'd command string.
 func shellReconExfil(content []byte) bool {
-	return shellRecon.Match(content) && shellExfil.Match(content)
+	return shellReconExfilRe.Match(content)
 }
 
 // looksObfuscated flags files with very long lines (minification) that also
@@ -563,6 +567,15 @@ func looksObfuscated(f *artifact.File) bool {
 }
 
 var regexpEvalMarker = regexp.MustCompile(`(?i)(eval\s*\(|new\s+Function\s*\(|atob\s*\(|base64\.b64decode|fromCharCode)`)
+
+// isMinified reports a minified/bundled artifact by line length. reverse-shell and
+// wiper idioms in readable source are payloads; the same tokens (mkfs, mkfifo, /dev/
+// tcp) inside a 2000+-char minified line are substring coincidences in a frontend
+// bundle (streamlit, google-adk false-positived on exactly this). The obfuscated-code
+// and dynamic-exec-decoded rules still cover genuinely-minified malicious payloads.
+func isMinified(b []byte) bool {
+	return maxLineLen(b) > 2000
+}
 
 func maxLineLen(b []byte) int {
 	max, cur := 0, 0
@@ -662,7 +675,9 @@ func isBuildTooling(path string) bool {
 	// rm -rf ~/) that execute at image build, not on the user's host — opencv-python
 	// ships Dockerfile_i686, swebench generates dockerfiles under harness/dockerfiles/.
 	if strings.Contains(b, "dockerfile") || strings.Contains(p, "/dockerfiles/") ||
-		strings.Contains(p, "/docker/") {
+		strings.Contains(p, "/docker/") || strings.HasSuffix(b, ".docker") ||
+		strings.Contains(p, "/packaging/") || strings.HasPrefix(p, "packaging/") ||
+		strings.Contains(p, "/nix/") || strings.Contains(p, "docker_utils") {
 		return true
 	}
 	return strings.Contains(p, "/tools/") || strings.HasPrefix(p, "tools/") ||
@@ -813,6 +828,8 @@ func isPublicIP(ab, bb, cb, db []byte) bool {
 	case a == 8 && b == 8 && (c == 8 || c == 4), a == 1 && b == 1 && c == 1 && d == 1: // public DNS
 		return false
 	case a == 1 && b == 2 && c == 3 && d == 4: // the universal placeholder/example IP (docstrings, tests)
+		return false
+	case a == b && b == c && c == d: // repeated-octet placeholders (12.12.12.12, 9.9.9.9) — never a real C2
 		return false
 	}
 	return true

