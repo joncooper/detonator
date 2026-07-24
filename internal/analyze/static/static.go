@@ -293,7 +293,7 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		// pedigree — that decodes to text containing URLs, which is not a
 		// payload. Scanning them as source produces false positives (e.g. a
 		// git-log blob tripping encoded-network-indicator), so skip them.
-		if isSBOM(f.Path) {
+		if isSBOM(f.Path) || isPackageMetadata(f.Path) {
 			continue
 		}
 		content := f.Content
@@ -789,6 +789,17 @@ func baseName(p string) string {
 // (CycloneDX or SPDX). Per PEP 770, Python packages ship these under
 // <dist-info>/sboms/. They are inert metadata describing provenance, so their
 // embedded base64/hex blobs are not code and must not be scanned as source.
+// isPackageMetadata reports generated package-metadata files (PKG-INFO, the wheel
+// METADATA, *.egg-info/*) — the long_description/README verbatim, never executed.
+// Their prose routinely quotes shell (`rm -rf $HOME` in a usage example: tldextract),
+// which is documentation, not a payload, so exclude them from the code-pattern scans.
+func isPackageMetadata(path string) bool {
+	p := strings.ToLower(path)
+	b := baseName(p)
+	return b == "pkg-info" || b == "metadata" || strings.Contains(p, ".egg-info/") ||
+		strings.Contains(p, ".dist-info/")
+}
+
 func isSBOM(path string) bool {
 	p := strings.ToLower(path)
 	if strings.Contains(p, "/sboms/") {
