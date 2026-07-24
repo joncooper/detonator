@@ -46,31 +46,41 @@ and the number we're actually missing. Do it first; it costs no burner and no to
 - **Cost:** cheap, no burner, hours. **Highest-leverage single number we're missing —
   do this first.**
 
-### 2. Backstabber's — tune set (many)
+### Backstabber's is a name index, not artifacts (verified)
 
-- **Source:** `dasfreak/Backstabbers-Knife-Collection` — a curated, manually-verified set
-  of real npm/pypi/ruby supply-chain malware, **much less CTF noise than Datadog**.
-  (Verify current size ~2–3k, password convention, and access before relying on it.)
-- **Use:** the *smaller* deterministic split (see discipline below). Static-score all +
-  detonate a sample. Diagnose misses → new / tightened rules. Cleaner, more diverse
-  tuning data than the ~80 Datadog + synthetic cases we've tuned on so far.
+`dasfreak/Backstabbers-Knife-Collection` on GitHub is the searchable **website + a name
+index** (`data/packages.json`): **npm 10,537 + pypi 4,040** curated, manually-verified
+malicious package *names* across 7 ecosystems — but **no artifacts in the repo** (the
+samples are the separate academic archive). So use it as a **cross-source label filter**,
+not an artifact source:
 
-### 3. Backstabber's — held-out (more)
+- Fetch artifacts from **Datadog** (27k, directly fetchable). A Datadog sample whose name
+  is in Backstabber's is **cross-source-confirmed malicious** (two independent curators
+  flagged it) — a much cleaner label than raw Datadog, which cuts the CTF/PoC noise.
+- Optionally pursue the separate Backstabber's academic archive later for true
+  different-curator *artifacts*; not needed for a first held-out.
 
-- **Use:** the *larger* remaining split, **never inspected during tuning**. After
-  workstream 2 tunes and the rules are **frozen**, eval this exactly once → an unbiased
-  recall (+ precision) number. Held-out is deliberately larger than the tune set for a
-  robust estimate.
-- Detonate the held-out once (behavioral), static-score it, and run the panel over the
-  ambiguous subset. Report **per-source** so single-source bias stays visible.
+### 2. Tune set (many) — Datadog ∩ Backstabber's, smaller split
+
+- The Datadog samples whose names appear in Backstabber's, screened for a real payload.
+- The *smaller* deterministic split (see discipline). Static-score all + detonate.
+  Diagnose misses → new / tightened rules. Cleaner, more diverse than the ~80 Datadog +
+  synthetic cases tuned on so far.
+
+### 3. Held-out (more) — same set, larger split
+
+- The *larger* remaining split of Datadog ∩ Backstabber's, **never inspected during
+  tuning**. After workstream 2 freezes the rules, eval this once → an unbiased recall.
+- Detonate it (behavioral — overnight budget covers it), static-score it, run the panel
+  over the ambiguous subset. Report per-source so single-source bias stays visible.
 
 ## Sources and their roles
 
 | Source | Role | Notes |
 |---|---|---|
-| top-N npm/pypi downloads | benign precision @ scale | free, clean, static-scalable |
-| Backstabber's Knife Collection | tune + held-out (clean) | manually verified, low CTF noise, cross-source |
-| Datadog `malicious_intent` | bulk (screened) | ~27k, but intent-labeled / noisy |
+| top-N npm/pypi downloads | benign precision @ scale | free, clean, static-scalable (`npm-high-impact`, `hugovk/top-pypi-packages`) |
+| Backstabber's Knife Collection | cross-source **label filter** | names only (npm 10.5k + pypi 4k); no artifacts in repo; cuts Datadog noise |
+| Datadog `malicious_intent` | artifact source (bulk) | ~27k, directly fetchable, but intent-labeled / noisy — filter via Backstabber's |
 | `ossf/malicious-packages` (OSV) | labels / selection cross-ref | advisories, not always the artifact |
 | MalwareBazaar | cross-source diversity check | thin on npm/pypi (mostly binaries); key on hand |
 
