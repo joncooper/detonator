@@ -41,7 +41,9 @@ var (
 	// urlopen/requests/socket connect, NOT a benign url= metadata field in setup().
 	// Benign setup.py runs build code (subprocess/compile/exec-of-version-file); it
 	// is a network or shell-danger action that distinguishes a malicious one.
-	pyNetCall = regexp.MustCompile(`(?i)(urllib\.request\.urlopen|urllib\.urlopen|\burlopen\s*\(|requests\.(get|post|put|patch|head|delete|request)\s*\(|httpx\.(get|post|request|Client)|http\.client|httplib|ftplib\.|smtplib\.|urllib3\.|socket\.socket\s*\(|\.connect\s*\(\s*\()`)
+	// Require an actual network CALL, not a bare module import: `import http.client`
+	// and `httplib` mentions are benign and false-positived on aiohttp/awscli/google-*.
+	pyNetCall = regexp.MustCompile(`(?i)(urllib\.request\.urlopen|urllib\.urlopen|\burlopen\s*\(|requests\.(get|post|put|patch|head|delete|request)\s*\(|httpx\.(get|post|request|Client)\s*\(|http\.client\.(HTTP|HTTPS)Connection\s*\(|httplib\.(HTTP|HTTPS)|ftplib\.FTP\s*\(|smtplib\.SMTP\s*\(|urllib3\.(PoolManager|HTTPConnection)|socket\.socket\s*\([^)]*\)[\s\S]{0,120}?\.connect\s*\(|\.connect\s*\(\s*\()`)
 
 	// netRoleBefore matches a network-role assignment/call immediately preceding a
 	// quoted IP — the shape of an actual endpoint (hostname:'1.2.3.4', connect('..')).
@@ -112,6 +114,11 @@ var (
 	// command (e.g. `node collect.js` -> collect.js), used to escalate a harvest
 	// that runs at install time.
 	scriptFileToken = regexp.MustCompile(`[\w./@-]+\.(?:js|cjs|mjs|ts)`)
+
+	// quotedStr matches a Python/JS string literal (triple- or single-quoted,
+	// escape-aware). Used to blank long inlined docstrings/READMEs in setup.py so
+	// their code EXAMPLES (`requests.get(url)`) don't read as install-time calls.
+	quotedStr = regexp.MustCompile(`(?s)""".*?"""|'''.*?'''|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'`)
 
 	// --- javascript-obfuscator fingerprint (family: obfuscated loader) ---
 	// hexIdent matches the _0x-hexadecimal identifiers that javascript-obfuscator
@@ -189,13 +196,18 @@ func pySetupExecution(u *artifact.Unpacked) []verdict.Signal {
 		if f == nil {
 			continue
 		}
+		// Scan with long string literals blanked: setup.py routinely inlines the
+		// README into long_description, whose code examples (`requests.get(url)`,
+		// `rm -rf`) are documentation, not install-time actions (false-positived on
+		// backoff). Real install code is not inside a string, so it survives.
+		code := stripLongLiterals(f.Content)
 		// A wiper whose only act is shutil.rmtree('/') or expanduser('~') is
 		// unambiguously destructive at install time.
-		if destructiveToken.Match(f.Content) {
+		if destructiveToken.Match(code) {
 			sigs = append(sigs, verdict.Signal{
 				Stage: "static", Rule: "destructive-payload", Severity: verdict.SevCritical,
 				Description: name + " runs a destructive/wiper command at install time",
-				Evidence:    firstMatch(destructiveToken, f.Content),
+				Evidence:    firstMatch(destructiveToken, code),
 			})
 		}
 		// Benign setup.py routinely runs code at build time (subprocess to compile,
@@ -204,10 +216,10 @@ func pySetupExecution(u *artifact.Unpacked) []verdict.Signal {
 		// setuptools / boto3. Fire only when the install-time code takes a genuinely
 		// dangerous action: a network CALL (download/exfil), a shell danger token, or
 		// exec/eval of decoded content.
-		if pyNetCall.Match(f.Content) || dangerToken.Match(f.Content) || dynExecDecoded.Match(f.Content) {
-			ev := firstMatch(pyNetCall, f.Content)
+		if pyNetCall.Match(code) || dangerToken.Match(code) || dynExecDecoded.Match(code) {
+			ev := firstMatch(pyNetCall, code)
 			if ev == "" {
-				ev = firstMatch(dangerToken, f.Content)
+				ev = firstMatch(dangerToken, code)
 			}
 			sigs = append(sigs, verdict.Signal{
 				Stage: "static", Rule: "py-setup-execution", Severity: verdict.SevCritical,
@@ -254,7 +266,7 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		// Dynamic execution of decoded content: exec/eval/interpreter-`-c` over
 		// base64/atob/unescape output. Benign code rarely does this; it is the
 		// canonical obfuscated-payload shape (matches GuardDog's rules).
-		if !seenExec && dynExecDecoded.Match(content) {
+		if !seenExec && !isTestOrDoc(f.Path) && !isDataConfig(f.Path) && dynExecDecoded.Match(content) {
 			sigs = append(sigs, verdict.Signal{
 				Stage: "static", Rule: "dynamic-exec-decoded", Severity: verdict.SevCritical,
 				Description: "executes dynamically-decoded code (exec/eval of base64/atob output)",
@@ -277,7 +289,8 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		}
 
 		// Base64 literals that decode to a URL or raw IP — a hidden C2/endpoint.
-		if !seenEncoded {
+		// Skip test/doc/example/data files (awscli ships base64 SVGs in .rst examples).
+		if !seenEncoded && !isTestOrDoc(f.Path) {
 			if dec, ok := decodedNetworkIndicator(content); ok {
 				sigs = append(sigs, verdict.Signal{
 					Stage: "static", Rule: "encoded-network-indicator", Severity: verdict.SevHigh,
@@ -288,10 +301,11 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 			}
 		}
 
-		// Secrets in test fixtures and documentation are placeholders, not leaks
-		// (requests ships test certs; boto3's docs use AWS's own AKIA…EXAMPLE key),
-		// so scan only real source.
-		if !seenSecret && !isTestOrDoc(f.Path) {
+		// Secrets in test fixtures, docs, and data/config are placeholders or schema,
+		// not leaks in executable code (requests ships test certs; boto3's docs use
+		// AWS's own AKIA…EXAMPLE key; litellm's provider-fields .json declares key
+		// fields), so scan only real source.
+		if !seenSecret && !isTestOrDoc(f.Path) && !isDataConfig(f.Path) {
 			if privateKey.Match(content) {
 				sigs = append(sigs, verdict.Signal{
 					Stage: "static", Rule: "embedded-private-key", Severity: verdict.SevMedium,
@@ -316,7 +330,7 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		// Reverse-shell / RAT payload sitting in ordinary source (family: reverse
 		// shell / RAT). Tier A literal idioms, or Tier B socket-fd-to-shell wiring.
 		// Both shapes are unambiguously malicious, so Critical. Skip test/doc.
-		if !seenRevShell && !isTestOrDoc(f.Path) {
+		if !seenRevShell && !isTestOrDoc(f.Path) && !isVendoredBundle(f.Path) && !isDataConfig(f.Path) {
 			if revShellIdiom.Match(content) {
 				sigs = append(sigs, verdict.Signal{
 					Stage: "static", Rule: "reverse-shell-source", Severity: verdict.SevCritical,
@@ -352,8 +366,8 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 		// Destructive / wiper payload in ordinary source (family: wiper). High in
 		// general source (may be conditional/time-bombed); the install-hook and
 		// setup.py contexts are graded Critical separately.
-		if !seenDestructive && !isTestOrDoc(f.Path) && !isBuildTooling(f.Path) &&
-			baseName(f.Path) != "package.json" && !isSetupFile(f.Path) && destructiveToken.Match(content) {
+		if !seenDestructive && !isTestOrDoc(f.Path) && !isBuildTooling(f.Path) && !isDataConfig(f.Path) &&
+			!isVendoredBundle(f.Path) && baseName(f.Path) != "package.json" && !isSetupFile(f.Path) && destructiveToken.Match(content) {
 			sigs = append(sigs, verdict.Signal{
 				Stage: "static", Rule: "destructive-payload", Severity: verdict.SevHigh,
 				Description: "source contains a destructive filesystem/disk operation (wiper)",
@@ -379,20 +393,18 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 			seenEnvExfil = true
 		}
 
-		// Host/identity reconnaissance sent to the network (family: recon exfil).
-		// Corroborating by default (Medium); install-time recon is escalated to
-		// High. Precision-sensitive (benign install analytics do this), so it is
-		// gated on the benign cohort — see phase3/benign-static-cohort.sh.
-		if !seenHostRecon && !isTestOrDoc(f.Path) && hostReconExfil(content) {
-			sev := verdict.SevMedium
-			desc := "collects host/user identity and sends it to the network (recon exfil)"
-			if hookTargets[baseName(f.Path)] || isSetupFile(f.Path) {
-				sev = verdict.SevHigh
-				desc = "install-time recon: collects host/user identity and sends it to the network"
-			}
+		// Host/identity reconnaissance sent to the network, at INSTALL TIME only
+		// (family: recon exfil). Reading host/user identity + connecting is the normal
+		// job of DB drivers, HTTP clients, and browser automation (asyncpg, playwright)
+		// — so at runtime it is not a signal. It only reads as recon when it runs
+		// during install: an npm hook target or a setup script. This keeps the
+		// login-paypal catch (a postinstall hook) while clearing the runtime-lib FPs.
+		if !seenHostRecon && (hookTargets[baseName(f.Path)] || isSetupFile(f.Path)) &&
+			!isTestOrDoc(f.Path) && !isVendoredBundle(f.Path) && hostReconExfil(content) {
 			sigs = append(sigs, verdict.Signal{
-				Stage: "static", Rule: "host-recon-exfil", Severity: sev,
-				Description: desc, Evidence: f.Path,
+				Stage: "static", Rule: "host-recon-exfil", Severity: verdict.SevHigh,
+				Description: "install-time recon: collects host/user identity and sends it to the network",
+				Evidence:    f.Path,
 			})
 			seenHostRecon = true
 		}
@@ -555,6 +567,18 @@ func hardcodedPublicEndpoint(content []byte) (string, bool) {
 // cleanups (rm -rf build, rmtree(workdir)), so they must not read as a payload.
 func isBuildTooling(path string) bool {
 	p := strings.ToLower(path)
+	b := baseName(p)
+	// Build files legitimately run destructive cleanups (rm -rf /usr in a cross-build
+	// Makefile — scipy ships one under a vendored ARPACK dir).
+	switch b {
+	case "makefile", "gnumakefile", "makefile.in", "makefile.am", "cmakelists.txt",
+		"dockerfile", "build.gradle", "pom.xml", "meson.build", "wscript", "sconstruct":
+		return true
+	}
+	if strings.HasSuffix(b, ".mk") || strings.HasSuffix(b, ".cmake") || strings.HasSuffix(b, ".bazel") ||
+		strings.HasSuffix(b, ".bzl") || strings.HasSuffix(b, ".gyp") || strings.HasSuffix(b, ".gypi") {
+		return true
+	}
 	return strings.Contains(p, "/tools/") || strings.HasPrefix(p, "tools/") ||
 		strings.Contains(p, "/ci/") || strings.Contains(p, "/.ci/") ||
 		strings.Contains(p, ".github/") || strings.Contains(p, ".gitlab-ci") ||
@@ -563,17 +587,61 @@ func isBuildTooling(path string) bool {
 		strings.Contains(p, "conftest") || strings.Contains(p, "vendored") ||
 		strings.Contains(p, "/vendor/") || strings.Contains(p, "/_vendor/") ||
 		strings.Contains(p, "/third_party/") || strings.Contains(p, "/third-party/") ||
-		strings.Contains(p, "/packaging/") || strings.Contains(p, "/meson")
+		strings.Contains(p, "/packaging/") || strings.Contains(p, "/meson") ||
+		strings.Contains(p, "/scripts/") || strings.HasPrefix(p, "scripts/") ||
+		strings.Contains(p, "/depends/") || strings.HasPrefix(p, "depends/")
 }
 
-// isTestOrDoc reports whether a path is a test, example, or documentation file,
-// where IP/pattern mentions are not payloads.
+// isDataConfig reports whether a path is a data/config file, not executable code.
+// A .yaml that *lists* malicious patterns (litellm's prompt-injection content filter
+// bundles `nc -e`, `mkfs`, `eval(atob` as filter categories) is data, not a payload,
+// so the code-execution heuristics skip it.
+func isDataConfig(path string) bool {
+	p := strings.ToLower(path)
+	for _, ext := range []string{".yaml", ".yml", ".json", ".toml", ".ini", ".cfg", ".lock", ".xml", ".csv", ".proto"} {
+		if strings.HasSuffix(p, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTestOrDoc reports whether a path is a non-payload location — a test, example,
+// doc, fixture, or data/cache file — where pattern matches are not a shipped payload.
+// Matching is component-based (a `test/` directory, not the substring in "latest"),
+// and it handles paths that *start* with the component (e.g. tests/certs/ca.key.pem),
+// which the old prefix checks missed and which false-positived on asyncpg/awscli.
 func isTestOrDoc(path string) bool {
 	p := strings.ToLower(path)
-	return strings.Contains(p, "/test") || strings.Contains(p, "test/") ||
-		strings.Contains(p, "_test") || strings.Contains(p, "/tests") ||
-		strings.Contains(p, "example") || strings.Contains(p, "/docs") ||
-		strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".txt") || strings.HasSuffix(p, ".rst")
+	for _, seg := range []string{
+		"test", "tests", "testing", "testdata", "example", "examples",
+		"fixture", "fixtures", "doc", "docs", "sample", "samples", "spec", "specs",
+		"__mocks__", "__snapshots__", "snapshots", "benchmark", "benchmarks",
+		"data", "cache", "discovery_cache",
+	} {
+		if p == seg || strings.HasPrefix(p, seg+"/") || strings.Contains(p, "/"+seg+"/") {
+			return true
+		}
+	}
+	return strings.Contains(p, "_test") || strings.Contains(p, ".test.") || strings.Contains(p, ".spec.") ||
+		strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".txt") || strings.HasSuffix(p, ".rst") ||
+		strings.HasSuffix(p, ".rdoc") || strings.HasSuffix(p, ".ipynb")
+}
+
+// isVendoredBundle reports whether a path is a bundled/minified vendor blob, where
+// coincidental byte sequences (a "cmd.exe" string, a socket call near a shell name)
+// trip the source-pattern rules. playwright/pnpm/vite ship these; they are compiled
+// output, not hand-written source, so the reverse-shell / recon heuristics skip them.
+func isVendoredBundle(path string) bool {
+	p := strings.ToLower(path)
+	b := baseName(p)
+	return strings.HasSuffix(b, ".min.js") || strings.HasSuffix(b, ".min.css") ||
+		strings.Contains(b, "bundle") ||
+		strings.Contains(p, "/dist/") || strings.HasPrefix(p, "dist/") ||
+		strings.Contains(p, "/vendor/") || strings.HasPrefix(p, "vendor/") ||
+		strings.Contains(p, "_next/") || strings.Contains(p, "/.next/") ||
+		strings.Contains(p, "/static/chunks/") || strings.Contains(p, "/build/") ||
+		strings.Contains(p, ".chunk.js") || strings.Contains(p, "/.output/")
 }
 
 // npmHookTargets returns the set of local script basenames referenced by npm
@@ -678,6 +746,18 @@ func isPrintable(b []byte) bool {
 		}
 	}
 	return printable*100/len(b) >= 90
+}
+
+// stripLongLiterals blanks the contents of string literals longer than 200 bytes —
+// inlined READMEs / docstrings — so the code examples they contain don't read as
+// executable install-time actions. Short literals (a URL arg, 'sh', '-c') are kept.
+func stripLongLiterals(b []byte) []byte {
+	return quotedStr.ReplaceAllFunc(b, func(m []byte) []byte {
+		if len(m) > 200 {
+			return []byte(`""`)
+		}
+		return m
+	})
 }
 
 func firstMatch(re *regexp.Regexp, b []byte) string {
