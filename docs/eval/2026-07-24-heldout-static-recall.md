@@ -131,9 +131,51 @@ loop working as intended: a rule that looks clean on 30 packages meets its FP cl
   true recall on packages that actually carry a payload is meaningfully higher than the
   headline.
 
+## Behavioral lift (measured)
+
+Static is only the first tier. To measure what the behavioral tier adds, I detonated
+**Set 2's static-misses** — the packages static *allowed* — in the patched
+package-analysis sandbox (import-phase continue + CI-env baits), and re-scored each with
+the trace. Any flip from `allow` to block/quarantine is a behavioral catch static could
+not have made.
+
+**Containment.** Real malware, so egress runs behind a recording sinkhole: a fake DNS
+resolver + TLS sink + iptables redirect. Verified before the run — a test connection to
+`evil-c2-test.example` resolved to the sink, connected to the sink, and the sink
+**captured the full request**; nothing reached the real internet. C2 lookups from live
+samples (e.g. `packages.storeartifact.com`) landed in the sink, contained.
+
+**Result (npm).** Of the **53 npm packages static allowed, detonation caught 34 (64%)**
+(3 more errored/timed out in the sandbox). Combined with Set 2's static recall, npm goes
+from **56% static-only (67/120) → 84% static+behavioral (101/120)**. Static missed these
+because the payload is a runtime beacon — the source ships no visible C2, and only at
+require/postinstall time does it resolve and connect to its collaborator host. The catches
+came through diverse runtime signals, not one blunt rule:
+
+| signal | n | what it caught |
+|---|---|---|
+| `unknown-domain` | 29 | C2 / collaborator beacons |
+| `process-spawn` | 4 | shelling out at install/import |
+| `data-destruction` | 3 | wipers that only fire at runtime |
+| `dns-exfil` | 2 | data tunneled over DNS |
+| `sensitive-read:ssh-private-key` | 1 | read `~/.ssh` (the honeytoken paid off) |
+| `exfil-chain` | 1 | read-then-send |
+
+This is the whole point of detonating: static and behavioral catch different things, and
+the layered detector catches what neither tier catches alone.
+
+**pypi is undercounted here — do not read the pypi rows as recall.** `pip` needs to fetch
+build dependencies to reach an import-time payload, and the sinkhole's registry allowlist
+is currently broken (the FORWARD DROP is ordered before the registry ACCEPTs; the host
+can't even reach the anycast registry IP). So dep-requiring pypi stealers fail to install
+and never run. Fixing the allowlist is the top detonation follow-up; until then the pypi
+behavioral number is a floor, not a measurement.
+
 ## Next
 
-1. **Behavioral lift** — detonate the Set 2 static-misses (the NET_BEACONs especially)
-   and measure static+detonation recall. This is the other half of the thesis.
-2. **Staged-exec rule** — tune on Set 1 misses, eval on a third fresh slice [240,…).
+1. **Staged-exec static rule** — the largest recoverable static gap (~25/150):
+   `exec(urlopen().read())`, `exec(b64decode(...))`. FP-prone; tune on Set 1 misses,
+   eval on a third fresh slice (`phase3/heldout/split.py … 3`), never Set 1 or Set 2.
+2. **Fix the sinkhole registry allowlist** so pypi detonation gets real build deps and
+   the pypi behavioral tier becomes a measurement, not a floor.
 3. Keep the split manifest committed so later draws stay disjoint.
