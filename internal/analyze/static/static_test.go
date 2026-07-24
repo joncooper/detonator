@@ -446,6 +446,15 @@ func TestBuildToolingDestructiveNotFlagged(t *testing.T) {
 			t.Fatalf("build tooling %q wrongly flagged destructive", path)
 		}
 	}
+	// Dockerfiles (any suffix/prefix) and container-build dirs do layer cleanups
+	// (rm -rf /var, rm -rf ~/) that run at image build, not the host — opencv-python
+	// (Dockerfile_i686, actions-runner.Dockerfile), swebench (harness/dockerfiles/).
+	for _, path := range []string{"docker/manylinux1/Dockerfile_i686", "3rdparty/zlib/actions-runner.Dockerfile", "swebench/harness/dockerfiles/c.py"} {
+		u := unpacked(map[string]string{path: "content = 'RUN rm -rf /var && rm -rf /root'"})
+		if hasRule(Analyze(art, u), "destructive-payload") != nil {
+			t.Fatalf("dockerfile build tooling %q wrongly flagged destructive", path)
+		}
+	}
 	// A real install-time wiper still fires.
 	hook := unpacked(map[string]string{"package.json": `{"name":"x","scripts":{"postinstall":"rm -rf --no-preserve-root /"}}`})
 	if hasRuleSet(Analyze(verdict.Artifact{Ecosystem: verdict.NPM}, hook))["destructive-payload"] != verdict.SevCritical {

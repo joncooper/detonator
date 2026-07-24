@@ -657,6 +657,14 @@ func isBuildTooling(path string) bool {
 		strings.HasSuffix(b, ".bzl") || strings.HasSuffix(b, ".gyp") || strings.HasSuffix(b, ".gypi") {
 		return true
 	}
+	// Dockerfiles (incl. suffixed variants like Dockerfile_i686) and the dirs that
+	// hold container build definitions run destructive layer cleanups (rm -rf /var,
+	// rm -rf ~/) that execute at image build, not on the user's host — opencv-python
+	// ships Dockerfile_i686, swebench generates dockerfiles under harness/dockerfiles/.
+	if strings.Contains(b, "dockerfile") || strings.Contains(p, "/dockerfiles/") ||
+		strings.Contains(p, "/docker/") {
+		return true
+	}
 	return strings.Contains(p, "/tools/") || strings.HasPrefix(p, "tools/") ||
 		strings.Contains(p, "/ci/") || strings.Contains(p, "/.ci/") ||
 		strings.Contains(p, ".github/") || strings.Contains(p, ".gitlab-ci") ||
