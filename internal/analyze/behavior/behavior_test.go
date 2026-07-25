@@ -1,6 +1,7 @@
 package behavior
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/joncooper/detonator/internal/verdict"
@@ -141,6 +142,32 @@ func TestMiningPoolEgress(t *testing.T) {
 	tr := &Trace{Analysis: map[string]Phase{"execute": {Sockets: []Socket{{Address: "45.9.148.1", Port: 3333}}}}}
 	if rules(Analyze(verdict.NPM, tr))["mining-pool-egress"] != verdict.SevHigh {
 		t.Fatal("mining-pool port not flagged")
+	}
+}
+
+func TestPackageManagerChurnNotDestruction(t *testing.T) {
+	// Regression: a benign `pip install requests` replaced an older certifi and
+	// deleted >25 files under site-packages, scoring data-destruction CRITICAL.
+	// Package managers rearranging their own install tree is not destruction.
+	var churn []FileOp
+	for i := 0; i < 60; i++ {
+		churn = append(churn, FileOp{
+			Path:   fmt.Sprintf("/app/.pyenv/lib/python3.12/site-packages/certifi-2022.12.7.dist-info/f%d", i),
+			Delete: true,
+		})
+	}
+	tr := &Trace{Analysis: map[string]Phase{"install": {Files: churn}}}
+	if rules(Analyze(verdict.PyPI, tr))["data-destruction"] != "" {
+		t.Fatal("package-manager install churn wrongly flagged as data-destruction")
+	}
+	// A real wiper deleting user data still fires.
+	var wipe []FileOp
+	for i := 0; i < 40; i++ {
+		wipe = append(wipe, FileOp{Path: fmt.Sprintf("/root/documents/file%d.txt", i), Delete: true})
+	}
+	real := &Trace{Analysis: map[string]Phase{"execute": {Files: wipe}}}
+	if rules(Analyze(verdict.NPM, real))["data-destruction"] != verdict.SevCritical {
+		t.Fatal("genuine mass deletion of user data no longer flagged")
 	}
 }
 

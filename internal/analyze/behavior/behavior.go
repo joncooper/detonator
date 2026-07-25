@@ -56,7 +56,7 @@ func Analyze(eco verdict.Ecosystem, tr *Trace) []verdict.Signal {
 					writtenExec[baseName(f.Path)] = true
 				}
 			}
-			if f.Delete {
+			if f.Delete && !isPackageManagerChurn(f.Path) {
 				deleted = append(deleted, f.Path)
 			}
 		}
@@ -194,6 +194,23 @@ func classifySensitiveRead(path string) (class string, rank int) {
 	default:
 		return "", 0
 	}
+}
+
+// isPackageManagerChurn reports a delete that is the package manager rearranging
+// its own install tree, not the package destroying user data. Installing a
+// dependency routinely replaces an already-present version, and unlinking the old
+// one deletes hundreds of files under site-packages / node_modules / the cache —
+// far past the destruction threshold. Measured: a benign `pip install requests`
+// deleted an older certifi and scored data-destruction CRITICAL. A genuine wiper
+// still counts, because it targets user data, devices, or system paths — none of
+// which live here.
+func isPackageManagerChurn(path string) bool {
+	p := strings.ToLower(path)
+	return containsAny(p,
+		"/site-packages/", "/dist-packages/", "/node_modules/", "/.pyenv/",
+		"/_cacache/", "/.npm/", "/.cache/pip/", "/pip-", "/.tmp-", "/tmp/pip-",
+		"/lib/python", "/.venv/", "/venv/", "/egg-info/", "/__pycache__/",
+	)
 }
 
 // isHomeScoped reports whether a path lives under a user's home directory, where
