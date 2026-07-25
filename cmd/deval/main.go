@@ -82,12 +82,21 @@ func main() {
 	fmt.Fprintf(os.Stderr, "deval: analyzing %d samples (%d workers)…\n", len(samples), *workers)
 	all := analyzeAll(samples, *workers)
 
+	// Analysis is the expensive pass and the policy replays are nearly free, so
+	// "all" runs every view from the single cache rather than paying for three
+	// separate processes.
 	switch *mode {
 	case "report":
 		report(all, engine.DefaultPolicy(), *jsonOut)
 	case "sweep":
 		sweep(all)
 	case "ablate":
+		ablate(all)
+	case "all":
+		report(all, engine.DefaultPolicy(), false)
+		fmt.Println("\n=== threshold sweep ===")
+		sweep(all)
+		fmt.Println("\n=== per-rule ablation ===")
 		ablate(all)
 	default:
 		fmt.Fprintf(os.Stderr, "deval: unknown -mode %q\n", *mode)
@@ -248,14 +257,70 @@ func report(all []scored, pol engine.Policy, asJSON bool) {
 	for _, r := range names {
 		fmt.Printf("%-34s %8d %8d\n", r, rules[r].mal, rules[r].ben)
 	}
+	missAnalysis(all, pol)
+}
+
+// missAnalysis asks why the missed malware was missed: did it produce sub-threshold
+// signals (so a PROMOTION could catch it) or nothing at all (so only a NEW RULE can)?
+// This is the difference between an operating point that is threshold-limited and one
+// that is coverage-limited, and it decides where effort should go.
+func missAnalysis(all []scored, pol engine.Policy) {
+	silent, subThreshold := 0, 0
+	subRules := map[string]int{}
+	for _, s := range all {
+		if s.err != "" || s.label != "malicious" {
+			continue
+		}
+		if d := engine.Decide(s.art, s.signals, pol, "deval").Decision; d != verdict.Allow {
+			continue
+		}
+		if len(s.signals) == 0 {
+			silent++
+			continue
+		}
+		subThreshold++
+		seen := map[string]bool{}
+		for _, sig := range s.signals {
+			if !seen[sig.Rule] {
+				seen[sig.Rule] = true
+				subRules[sig.Rule]++
+			}
+		}
+	}
+	total := silent + subThreshold
+	if total == 0 {
+		return
+	}
+	fmt.Printf("\n--- why the %d misses were missed ---\n", total)
+	fmt.Printf("no signal at all (needs a NEW RULE)          : %d (%.0f%%)\n",
+		silent, float64(silent)/float64(total)*100)
+	fmt.Printf("sub-threshold signal (a PROMOTION may catch) : %d (%.0f%%)\n",
+		subThreshold, float64(subThreshold)/float64(total)*100)
+	type kv struct {
+		r string
+		n int
+	}
+	var ks []kv
+	for r, n := range subRules {
+		ks = append(ks, kv{r, n})
+	}
+	sort.Slice(ks, func(i, j int) bool { return ks[i].n > ks[j].n })
+	for i, k := range ks {
+		if i >= 8 {
+			break
+		}
+		fmt.Printf("   %-32s %d\n", k.r, k.n)
+	}
 }
 
 // sweep walks the quorum grid and prints the recall/FP trade-off curve.
 func sweep(all []scored) {
 	fmt.Printf("%-10s %-8s %-8s %10s %10s %8s\n", "critQ", "highQ", "medQ", "recall%", "benignFP%", "blocked")
+	// medQ=1 is included deliberately: with FP headroom under budget, the question
+	// is whether a LOWER bar buys recall, not only whether a higher one saves FP.
 	for _, cq := range []int{1, 2} {
 		for _, hq := range []int{1, 2, 3} {
-			for _, mq := range []int{2, 3, 4} {
+			for _, mq := range []int{1, 2, 3, 4} {
 				pol := engine.Policy{CriticalQuorum: cq, HighQuorum: hq, MediumQuorum: mq}
 				t := apply(all, pol)
 				fmt.Printf("%-10d %-8d %-8d %9.1f%% %9.2f%% %8d\n",
