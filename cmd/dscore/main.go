@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/joncooper/detonator/internal/engine"
 	"github.com/joncooper/detonator/internal/score"
@@ -32,7 +33,27 @@ func main() {
 	triageEffort := flag.String("triage-effort", "medium", "codex reasoning effort: minimal|low|medium|high|xhigh (with -triage codex)")
 	triageSchema := flag.String("triage-schema", "phase0/verdict-schema.json", "path to the triage output schema (with -triage codex)")
 	triageRaw := flag.String("triage-raw", "", "append the raw codex interaction (prompt + response) to this JSONL file, for offline analysis")
+	highQuorum := flag.Int("high-quorum", 0, "how many high signals quarantine (0 = default 1) — for threshold sweeps")
+	medQuorum := flag.Int("medium-quorum", 0, "how many medium signals quarantine (0 = default 2) — for threshold sweeps")
+	critQuorum := flag.Int("critical-quorum", 0, "how many critical signals block (0 = default 1) — for threshold sweeps")
+	disableRules := flag.String("disable-rule", "", "comma-separated rule names to suppress — for per-rule ablation")
+	failClosed := flag.Bool("fail-closed", false, "quarantine becomes block (high-security posture)")
 	flag.Parse()
+
+	pol := engine.Policy{
+		FailClosed:     *failClosed,
+		CriticalQuorum: *critQuorum,
+		HighQuorum:     *highQuorum,
+		MediumQuorum:   *medQuorum,
+	}
+	if *disableRules != "" {
+		pol.DisabledRules = map[string]bool{}
+		for _, r := range strings.Split(*disableRules, ",") {
+			if r = strings.TrimSpace(r); r != "" {
+				pol.DisabledRules[r] = true
+			}
+		}
+	}
 
 	// At least one evidence source is required; either may stand alone. Static-only
 	// (-tarball, no -trace) is the offline precision-gate path; trace-only is the
@@ -95,9 +116,9 @@ func main() {
 
 	var v verdict.Verdict
 	if model != nil {
-		v = score.ScoreTriage(context.Background(), in, engine.DefaultPolicy(), model)
+		v = score.ScoreTriage(context.Background(), in, pol, model)
 	} else {
-		v = score.Score(in, engine.DefaultPolicy())
+		v = score.Score(in, pol)
 	}
 	out, _ := json.MarshalIndent(v, "", "  ")
 	fmt.Println(string(out))

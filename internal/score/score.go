@@ -31,6 +31,16 @@ func Score(in Input, pol engine.Policy) verdict.Verdict {
 	return engine.Decide(v.art, v.signals, pol, "score")
 }
 
+// Signals runs the rules and returns the raw signals without deciding. Analysis
+// (unpack + regex over every file) dominates the cost of scoring while the
+// verdict itself is cheap, so an evaluation that sweeps thresholds or ablates
+// rules analyzes each sample ONCE through this and then replays many policies
+// over the cached signals via engine.Decide.
+func Signals(in Input) (verdict.Artifact, []verdict.Signal) {
+	v, _ := analyze(in)
+	return v.art, v.signals
+}
+
 // ScoreTriage is Score plus an LLM adjudication stage: the model sees the
 // deterministic signals, bounded source excerpts, and the behavior log, and its
 // judgment is composed alongside the rules (a rules/LLM disagreement on whether to

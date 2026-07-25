@@ -19,13 +19,45 @@ type Policy struct {
 	// quarantines for human review; on means it blocks. Exposed so a
 	// high-security org can choose fail-closed.
 	FailClosed bool
+
+	// CriticalQuorum / HighQuorum / MediumQuorum are how many signals of that
+	// severity it takes to trigger. Zero means "use the default" so the zero
+	// Policy keeps the shipped behaviour (1 critical blocks, 1 high quarantines,
+	// 2 mediums quarantine). Exposed so the operating point can be swept against
+	// a benign cohort rather than assumed — see docs/eval/ threshold sweep.
+	CriticalQuorum int
+	HighQuorum     int
+	MediumQuorum   int
+
+	// DisabledRules suppresses signals by rule name before the decision is made.
+	// Used for per-rule ablation (measuring each rule's recall and FP
+	// contribution) and to switch off a rule in the field without a rebuild.
+	DisabledRules map[string]bool
 }
 
 // DefaultPolicy is fail-to-review (build-plan §7 decision 4).
 func DefaultPolicy() Policy { return Policy{FailClosed: false} }
 
+// quorum resolves a configured threshold, falling back to the shipped default.
+func quorum(configured, def int) int {
+	if configured <= 0 {
+		return def
+	}
+	return configured
+}
+
 // Decide composes signals into a verdict for art.
 func Decide(art verdict.Artifact, signals []verdict.Signal, pol Policy, engineName string) verdict.Verdict {
+	if len(pol.DisabledRules) > 0 {
+		kept := make([]verdict.Signal, 0, len(signals))
+		for _, s := range signals {
+			if !pol.DisabledRules[s.Rule] {
+				kept = append(kept, s)
+			}
+		}
+		signals = kept
+	}
+
 	counts := map[verdict.Severity]int{}
 	for _, s := range signals {
 		counts[s.Severity]++
@@ -33,11 +65,11 @@ func Decide(art verdict.Artifact, signals []verdict.Signal, pol Policy, engineNa
 
 	decision := verdict.Allow
 	switch {
-	case counts[verdict.SevCritical] > 0:
+	case counts[verdict.SevCritical] >= quorum(pol.CriticalQuorum, 1):
 		decision = verdict.Block
-	case counts[verdict.SevHigh] > 0:
+	case counts[verdict.SevHigh] >= quorum(pol.HighQuorum, 1):
 		decision = verdict.Quarantine
-	case counts[verdict.SevMedium] >= 2:
+	case counts[verdict.SevMedium] >= quorum(pol.MediumQuorum, 2):
 		// A lone medium (a test key, one minified vendor blob) is common in
 		// benign packages; two independent mediums is worth a human look.
 		decision = verdict.Quarantine

@@ -28,3 +28,6 @@ docs/eval/**/traces/
 
 # Detonation trace corpora (malware behavior logs — never commit)
 eval-captures/
+
+# deval corpus (fetched artifacts, incl. malware — never commit)
+/deval
