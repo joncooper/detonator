@@ -145,6 +145,33 @@ func TestMiningPoolEgress(t *testing.T) {
 	}
 }
 
+func TestHarnessArgvDoesNotTriggerDropAndExecute(t *testing.T) {
+	// Regression: benign acorn/esbuild/resolve/jsesc all hard-BLOCKED at CRITICAL.
+	// npm stages the package's own bin script under /root/.npm/_cacache/tmp/ (home
+	// scoped, extensionless -> reads as an executable drop) while the analysis
+	// harness passes the bare package name in its own argv. Basename matching made
+	// those collide. A bare word is not execution of a file.
+	tr := &Trace{Analysis: map[string]Phase{"install": {
+		Files: []FileOp{
+			{Path: "/root/.npm/_cacache/tmp/nMbJV1/bin/acorn", Write: true},
+			{Path: "/app/node_modules/acorn/bin/acorn", Write: true},
+		},
+		Commands: []Command{{Command: []string{
+			"node", "/usr/local/bin/analyze-node.js", "--local", "/acorn.tgz", "install", "acorn"}}},
+	}}}
+	if rules(Analyze(verdict.NPM, tr))["download-and-execute"] != "" {
+		t.Fatal("harness argv / npm cache collision wrongly flagged as download-and-execute")
+	}
+	// A genuine dropper references the PATH it wrote, and still fires.
+	real := &Trace{Analysis: map[string]Phase{"install": {
+		Files:    []FileOp{{Path: "/tmp/stage2.sh", Write: true, Read: true}},
+		Commands: []Command{{Command: []string{"sh", "/tmp/stage2.sh"}}},
+	}}}
+	if rules(Analyze(verdict.NPM, real))["download-and-execute"] != verdict.SevCritical {
+		t.Fatal("genuine drop-and-execute no longer flagged")
+	}
+}
+
 func TestPackageManagerChurnNotDestruction(t *testing.T) {
 	// Regression: a benign `pip install requests` replaced an older certifi and
 	// deleted >25 files under site-packages, scoring data-destruction CRITICAL.

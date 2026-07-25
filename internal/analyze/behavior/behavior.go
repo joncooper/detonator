@@ -52,7 +52,11 @@ func Analyze(eco verdict.Ecosystem, tr *Trace) []verdict.Signal {
 						Description: desc + " during " + phase, Evidence: f.Path,
 					})
 				}
-				if looksExecutablePath(f.Path) {
+				// Files the package manager unpacks into its own cache or install
+				// tree are not "dropped payloads" — npm stages every package's bin
+				// script under /root/.npm/_cacache/tmp/, which is home-scoped and
+				// extensionless and so otherwise reads as an executable drop.
+				if looksExecutablePath(f.Path) && !isPackageManagerChurn(f.Path) {
 					writtenExec[baseName(f.Path)] = true
 				}
 			}
@@ -288,8 +292,20 @@ func looksExecutablePath(path string) bool {
 
 // spawnsWritten returns the argv token that names a file the package dropped —
 // the download/drop-and-execute pattern.
+//
+// The token must reference a PATH. A bare word that merely equals a dropped
+// file's basename is not execution of it, and matching bare words made this rule
+// fire CRITICAL on benign acorn, esbuild, resolve and jsesc: npm's cache writes
+// the package's own bin script to /root/.npm/_cacache/tmp/.../bin/<pkg> (home
+// scoped, no extension, so it reads as an executable drop) while the analysis
+// harness passes the bare package name on its own command line
+// (`analyze-node.js --local /acorn.tgz install acorn`). The two collided.
+// A genuine dropper always references the path it wrote: `sh /tmp/stage2.sh`.
 func spawnsWritten(argv []string, written map[string]bool) string {
 	for _, a := range argv {
+		if !strings.Contains(a, "/") {
+			continue
+		}
 		if written[baseName(a)] {
 			return a
 		}
