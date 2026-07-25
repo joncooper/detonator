@@ -172,6 +172,11 @@ var (
 	// description docstring (passlib) or a homepage URL elsewhere in the file.
 	shellReconExfilRe = regexp.MustCompile(`(?is)((?:curl|wget|\bnc\b|\bncat\b|base64\b|exec\s*\(|child_process|os\.system|subprocess).{0,250}?(?:\$\(\s*(?:whoami|hostname|id)|\bwhoami\b|/etc/(?:passwd|shadow)|~/\.ssh/|\.aws/credentials|\.ssh/id_(?:rsa|ed25519))|(?:\$\(\s*(?:whoami|hostname|id)|\bwhoami\b|/etc/(?:passwd|shadow)|~/\.ssh/|\.aws/credentials).{0,250}?(?:curl|wget|\bnc\b|base64\b|\|\s*(?:ba)?sh))`)
 
+	// --- install-hook fetches an external endpoint (family: install beacon) ---
+	// urlHost pulls the host out of a URL literal so it can be checked against the
+	// set of endpoints an install script may legitimately contact.
+	urlHost = regexp.MustCompile(`(?i)https?://([A-Za-z0-9._\-]+)`)
+
 	// hardcodedWebhook: a Discord webhook or Telegram bot endpoint carrying a real
 	// id+token — the canonical token/cookie-stealer exfil sink. A full snowflake id
 	// plus token keeps bare API-doc mentions out; benign packages essentially never
@@ -290,6 +295,7 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 	seenHostRecon := false
 	seenObfCode := false
 	seenWebhook := false
+	seenHookFetch := false
 	hookTargets := npmHookTargets(u)
 	for i := range u.Files {
 		f := &u.Files[i]
@@ -454,6 +460,23 @@ func scanContents(u *artifact.Unpacked) []verdict.Signal {
 			seenHostRecon = true
 		}
 
+		// An install hook whose TARGET SCRIPT calls out to a hardcoded endpoint
+		// outside the registry/dev-infra allowlist — the install-beacon shape.
+		// npm-install-hook-network only inspects the hook COMMAND, so a hook that
+		// merely runs `node postinstall.js` hides the endpoint one file away; that
+		// gap is ~half of the sub-threshold misses on the 2026 held-out set.
+		if !seenHookFetch && (hookTargets[baseName(f.Path)] || isSetupFile(f.Path)) &&
+			!isTestOrDoc(f.Path) && !isVendoredBundle(f.Path) {
+			if host, ok := externalInstallFetch(content); ok {
+				sigs = append(sigs, verdict.Signal{
+					Stage: "static", Rule: "install-hook-external-fetch", Severity: verdict.SevHigh,
+					Description: "install hook script contacts a hardcoded endpoint outside the registry",
+					Evidence:    f.Path + ": " + host,
+				})
+				seenHookFetch = true
+			}
+		}
+
 		// A hardcoded Discord/Telegram exfil webhook (with a real id+token) — the
 		// canonical stealer sink. Malicious regardless of when it runs (import-time
 		// stealers are the norm), so it is not gated to install context. High ->
@@ -553,6 +576,76 @@ func pyObfuscated(content []byte) bool {
 		}
 	}
 	return false
+}
+
+// installFetchAllowedHost reports whether an install script may legitimately
+// contact this host: the package registries and the dev infrastructure that
+// native packages pull prebuilt binaries and headers from. Allowing GitHub and
+// nodejs.org costs some recall (malware can host a payload there too) but is the
+// honest trade — sharp, node-sass, playwright and friends genuinely fetch from
+// them at install, and a rule that quarantines those is a rule that gets disabled.
+func installFetchAllowedHost(host string) bool {
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, suffix := range []string{
+		"npmjs.org", "npmjs.com", "yarnpkg.com", "npmmirror.com",
+		"pypi.org", "pythonhosted.org",
+		"nodejs.org", "githubusercontent.com", "github.com", "snapcraft.io",
+		"localhost", "127.0.0.1",
+	} {
+		if h == suffix || strings.HasSuffix(h, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// ephemeralTunnelHost reports an interactsh/collaborator, request-bin, or ad-hoc
+// tunnel endpoint. These exist to receive a callback from somewhere else and are
+// essentially absent from legitimate install scripts, so one is sufficient on its
+// own — unlike a generic unknown host, which is routinely a vendor's binary CDN.
+func ephemeralTunnelHost(host string) bool {
+	h := strings.ToLower(host)
+	for _, s := range []string{
+		"oastify.com", "oast.fun", "oast.pro", "oast.live", "oast.site", "oast.me",
+		"burpcollaborator.net", "interact.sh", "interactsh.com", "canarytokens.com",
+		"ngrok.io", "ngrok-free.app", "ngrok.app", "ngrok.dev",
+		"webhook.site", "requestbin.com", "requestbin.net", "pipedream.net",
+		"requestcatcher.com", "beeceptor.com", "mockbin.org",
+		"trycloudflare.com", "loca.lt", "localtunnel.me", "serveo.net", "telebit.io",
+	} {
+		if h == s || strings.HasSuffix(h, "."+s) {
+			return true
+		}
+	}
+	return false
+}
+
+// externalInstallFetch reports an install-time call to a hardcoded endpoint that
+// is both outside the allowed set AND carries a second indicator of malice.
+//
+// The network call is required because core-js only PRINTS funding URLs from its
+// postinstall. The allowlist handles esbuild, which really does download at
+// install but from the registry. Neither is enough on its own, though: packages
+// legitimately pull prebuilt binaries from their own CDN (the
+// benign-platform-detect-download control), so an unknown host is not by itself
+// suspicious. The second indicator is either an ephemeral tunnel/collaborator
+// endpoint, or host identity flowing out with the request — which is what
+// separates "fetch a binary" from "call home with who I am".
+func externalInstallFetch(content []byte) (string, bool) {
+	if !netPrimitive.Match(content) {
+		return "", false
+	}
+	identityLeak := hostRecon.Match(content)
+	for _, m := range urlHost.FindAllSubmatch(content, 60) {
+		host := string(m[1])
+		if installFetchAllowedHost(host) {
+			continue
+		}
+		if ephemeralTunnelHost(host) || identityLeak {
+			return host, true
+		}
+	}
+	return "", false
 }
 
 // shellReconExfil reports a shell command that both recons host/credential state

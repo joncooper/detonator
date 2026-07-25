@@ -33,6 +33,12 @@ type Policy struct {
 	// Used for per-rule ablation (measuring each rule's recall and FP
 	// contribution) and to switch off a rule in the field without a rebuild.
 	DisabledRules map[string]bool
+
+	// SeverityOverride re-grades a rule before the decision. A rule's severity is
+	// a judgement about how much evidence it carries, and that judgement should be
+	// measurable against a corpus rather than fixed at authoring time — promoting
+	// or demoting here lets the recall/FP consequence be swept before it ships.
+	SeverityOverride map[string]verdict.Severity
 }
 
 // DefaultPolicy is fail-to-review (build-plan §7 decision 4).
@@ -48,12 +54,16 @@ func quorum(configured, def int) int {
 
 // Decide composes signals into a verdict for art.
 func Decide(art verdict.Artifact, signals []verdict.Signal, pol Policy, engineName string) verdict.Verdict {
-	if len(pol.DisabledRules) > 0 {
+	if len(pol.DisabledRules) > 0 || len(pol.SeverityOverride) > 0 {
 		kept := make([]verdict.Signal, 0, len(signals))
 		for _, s := range signals {
-			if !pol.DisabledRules[s.Rule] {
-				kept = append(kept, s)
+			if pol.DisabledRules[s.Rule] {
+				continue
 			}
+			if sev, ok := pol.SeverityOverride[s.Rule]; ok {
+				s.Severity = sev
+			}
+			kept = append(kept, s)
 		}
 		signals = kept
 	}
