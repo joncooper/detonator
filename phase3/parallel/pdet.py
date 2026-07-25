@@ -7,7 +7,7 @@ Each detonation gets its own results dir; DETONATOR_PARALLEL makes the sandbox
 scope its cleanup to its own container instead of `podman rm --all --force`,
 which is what made concurrency lose ~33% of traces.
 """
-import os, sys, glob, json, subprocess, shutil, collections
+import os, sys, glob, json, shlex, subprocess, shutil, collections
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ROOT = "/home/ubuntu"
@@ -42,6 +42,37 @@ if os.path.isdir("/home/ubuntu/stores"):
         _slots.put(_d)
 
 
+def preserve_telemetry(name, rd):
+    """Keep the RAW telemetry, not just the summarised trace.
+
+    results.json is a lossy summary (a socket to host:port, a file write) DERIVED
+    from far richer evidence that the run throws away: the gVisor boot log is a
+    full syscall strace (~18MB/sample: every open, exec, connect with arguments)
+    and write_buffers_.zip holds the actual BYTES the package wrote. Without these
+    a new detector idea can only ever use signals the current summariser already
+    extracted, and testing anything else means re-detonating the whole corpus.
+
+    Compressed they are ~1-2MB/sample, which is cheap next to a burner-hour.
+    """
+    dst = f"{OUT}/telemetry/{name}"
+    os.makedirs(dst, exist_ok=True)
+    try:
+        boots = glob.glob(rd + "/l/*/runsc.log.boot")
+        if boots:
+            biggest = max(boots, key=os.path.getsize)
+            subprocess.run(f"sudo gzip -c {shlex.quote(biggest)} > {shlex.quote(dst)}/strace.log.gz",
+                           shell=True, timeout=180)
+        wb = rd + "/fw/write_buffers_.zip"
+        if os.path.exists(wb):
+            subprocess.run(["sudo", "cp", wb, dst + "/write_buffers.zip"], timeout=120)
+        st = rd + "/s/results.json"
+        if os.path.exists(st):
+            subprocess.run(["sudo", "cp", st, dst + "/static.json"], timeout=60)
+        subprocess.run(["sudo", "chown", "-R", "ubuntu:ubuntu", dst], timeout=60)
+    except Exception:
+        pass
+
+
 def one(eco, name, tb):
     store = _slots.get() if _slots else None
     try:
@@ -73,6 +104,7 @@ def _one(eco, name, tb, store):
     if not os.path.exists(trace):
         return (name, "NO_TRACE", "", 0)
     shutil.copy(trace, f"{OUT}/traces/{name}.json")
+    preserve_telemetry(name, rd)
     installed = sum(1 for l in open(logp, errors="ignore") if "Install succeeded" in l)
     try:
         j = json.loads(subprocess.run(

@@ -5,8 +5,27 @@ package verdict
 
 import (
 	"encoding/json"
+	"runtime/debug"
 	"time"
 )
+
+// RulesVersion is the VCS revision of this build, read once from the embedded
+// build info (`-buildvcs`, on by default). It stamps every verdict so a stored
+// result can be tied to the rules that produced it. "unknown" if no VCS stamp.
+var RulesVersion = func() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" {
+				rev := s.Value
+				if len(rev) > 12 {
+					rev = rev[:12]
+				}
+				return rev
+			}
+		}
+	}
+	return "unknown"
+}()
 
 // Decision is the admission outcome for one package artifact.
 type Decision string
@@ -78,6 +97,12 @@ type Verdict struct {
 	DecidedAt time.Time    `json:"decided_at"`
 	// Engine records which pipeline produced this verdict, for auditability.
 	Engine string `json:"engine"`
+	// RulesVersion is the build (git revision) of the rule set that produced this
+	// verdict. Without it a stored result cannot be tied to the rules behind it, so
+	// a re-scored corpus silently mixes verdicts from different rule versions — a
+	// trap already hit once when a stale dscore scored an eval. Empty if the build
+	// carries no VCS stamp.
+	RulesVersion string `json:"rules_version,omitempty"`
 }
 
 // Canonical returns the deterministic byte encoding of v that is signed and

@@ -94,8 +94,9 @@ func Decide(art verdict.Artifact, signals []verdict.Signal, pol Policy, engineNa
 		Decision:  decision,
 		Reason:    reason(decision, signals, counts),
 		Signals:   sortSignals(signals),
-		DecidedAt: time.Now().UTC(),
-		Engine:    engineName,
+		DecidedAt:    time.Now().UTC(),
+		Engine:       engineName,
+		RulesVersion: verdict.RulesVersion,
 	}
 }
 
