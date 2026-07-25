@@ -144,6 +144,60 @@ func TestMiningPoolEgress(t *testing.T) {
 	}
 }
 
+func TestHardcodedIPEgress(t *testing.T) {
+	// Raw-IP connect-back with no DNS — the elf-stats-* reverse-shell shape that the
+	// DNS-based unknown-domain rule can't see.
+	tr := &Trace{Analysis: map[string]Phase{"import": {Sockets: []Socket{{Address: "161.97.148.123", Port: 9000}}}}}
+	if rules(Analyze(verdict.NPM, tr))["hardcoded-ip-egress"] != verdict.SevHigh {
+		t.Fatalf("hardcoded raw-IP connect-back not flagged high: %+v", Analyze(verdict.NPM, tr))
+	}
+	// Precision: a public IP resolved FROM a hostname is judged by the DNS path, not here.
+	resolved := &Trace{Analysis: map[string]Phase{"install": {Sockets: []Socket{{Address: "93.184.216.34", Port: 443, Hostnames: []string{"api.example.com"}}}}}}
+	if rules(Analyze(verdict.NPM, resolved))["hardcoded-ip-egress"] != "" {
+		t.Fatal("domain-resolved connection wrongly flagged as hardcoded-ip-egress")
+	}
+	// Precision: private/loopback/CGNAT/TEST-NET(sinkhole)/public-DNS must not fire.
+	for _, addr := range []string{"10.0.0.5", "192.168.1.1", "127.0.0.1", "100.64.0.1", "192.0.2.1", "8.8.8.8", "1.1.1.1"} {
+		benign := &Trace{Analysis: map[string]Phase{"install": {Sockets: []Socket{{Address: addr, Port: 443}}}}}
+		if rules(Analyze(verdict.NPM, benign))["hardcoded-ip-egress"] != "" {
+			t.Fatalf("non-routable/benign IP %s wrongly flagged as hardcoded-ip-egress", addr)
+		}
+	}
+	// Exfil chain: a credential read + raw-IP egress escalates to critical.
+	chain := &Trace{Analysis: map[string]Phase{"install": {
+		Files:   []FileOp{{Path: "/root/.aws/credentials", Read: true}},
+		Sockets: []Socket{{Address: "161.97.148.123", Port: 9000}},
+	}}}
+	if rules(Analyze(verdict.NPM, chain))["exfil-chain"] != verdict.SevCritical {
+		t.Fatal("cred-read + raw-IP egress not escalated to exfil-chain")
+	}
+}
+
+func TestTokenReadExfilChain(t *testing.T) {
+	// .npmrc read + UNKNOWN egress (raw-IP C2) -> exfil-chain (registry-token theft).
+	steal := &Trace{Analysis: map[string]Phase{"install": {
+		Files:   []FileOp{{Path: "/root/.npmrc", Read: true}},
+		Sockets: []Socket{{Address: "185.62.188.9", Port: 443}},
+	}}}
+	if rules(Analyze(verdict.NPM, steal))["exfil-chain"] != verdict.SevCritical {
+		t.Fatal(".npmrc read + unknown egress not escalated to exfil-chain")
+	}
+	// Precision: a baseline npm install reads .npmrc but only reaches the registry —
+	// this is EVERY install and must NOT fire exfil-chain.
+	benign := &Trace{Analysis: map[string]Phase{"install": {
+		Files:   []FileOp{{Path: "/root/.npmrc", Read: true}, {Path: "/usr/lib/node_modules/npm/npmrc", Read: true}},
+		Sockets: []Socket{{Address: "104.16.2.34", Port: 443, Hostnames: []string{"registry.npmjs.org"}}},
+		DNS:     []DNSRecord{{Queries: []DNSQuery{{Hostname: "registry.npmjs.org"}}}},
+	}}}
+	if rules(Analyze(verdict.NPM, benign))["exfil-chain"] != "" {
+		t.Fatal("baseline .npmrc read + registry-only egress wrongly flagged as exfil-chain")
+	}
+	// The standalone .npmrc read stays Info (no verdict effect on its own).
+	if rules(Analyze(verdict.NPM, benign))["sensitive-read:npm-token"] != verdict.SevInfo {
+		t.Fatal(".npmrc read should remain SevInfo standalone")
+	}
+}
+
 func TestReconBurstAndDNSExfil(t *testing.T) {
 	recon := &Trace{Analysis: map[string]Phase{"install": {Commands: []Command{
 		{Command: []string{"uname", "-a"}}, {Command: []string{"whoami"}}, {Command: []string{"hostname"}},

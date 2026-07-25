@@ -77,11 +77,13 @@ var (
 	// are near-absent from benign package source.
 	revShellIdiom = regexp.MustCompile(`(?i)(/dev/(tcp|udp)/|(ba)?sh\s+-i\b[^\n]*(>&|0>&1|>\s*/dev/tcp)|\b(nc|ncat)\b[^\n|]*\s-[ce]\b|mkfifo\b[^\n]*\|\s*(ba)?sh|socat\b[^\n]*(exec|system):)`)
 	// Tier B: language-native socket-to-shell wiring. Fires only on the triple of
-	// a connect-back primitive, a file-descriptor binding, and a shell target in
-	// one file — benign clients open sockets and even spawn shells, but never bind
-	// a socket's fd onto a shell's stdio.
+	// a connect-back primitive, a stdio binding, and a shell target in one file —
+	// benign clients open sockets and even spawn shells, but never wire a socket
+	// onto a shell's stdio. The binding is either fd dup (dup2/stdio:[]) or Node
+	// stream piping (`client.pipe(sh.stdin); sh.stdout.pipe(client)`) — the latter
+	// is the common JS reverse shell that the dup2-only form missed (elf-stats-*).
 	revShellConnect = regexp.MustCompile(`(?i)(net\.(connect|Socket)\s*\(|socket\.socket\s*\(|\.connect\s*\()`)
-	revShellBind    = regexp.MustCompile(`(?i)(os\.dup2\s*\(|\bdup2\s*\(|stdio\s*:\s*\[)`)
+	revShellBind    = regexp.MustCompile(`(?i)(os\.dup2\s*\(|\bdup2\s*\(|stdio\s*:\s*\[|\.pipe\s*\()`)
 	revShellTarget  = regexp.MustCompile(`(?i)(/bin/(ba)?sh|pty\.spawn\s*\(|cmd\.exe)`)
 
 	// --- cryptominer bundled-artifact signatures (family: cryptominer) ---

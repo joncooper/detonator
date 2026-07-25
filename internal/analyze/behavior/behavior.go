@@ -11,6 +11,7 @@ package behavior
 
 import (
 	"fmt"
+	"net"
 	"regexp"
 	"strings"
 
@@ -22,6 +23,7 @@ import (
 func Analyze(eco verdict.Ecosystem, tr *Trace) []verdict.Signal {
 	var sigs []verdict.Signal
 	sawCredentialRead := false
+	sawTokenRead := false            // registry-auth reads (.npmrc/.netrc) — baseline alone, exfil only WITH unknown egress
 	writtenExec := map[string]bool{} // basenames of executable-looking dropped files
 	reconTools := map[string]bool{}  // distinct host-profiling tools seen
 	var deleted []string
@@ -34,6 +36,8 @@ func Analyze(eco verdict.Ecosystem, tr *Trace) []verdict.Signal {
 				if class, sev := classifySensitiveRead(f.Path); class != "" {
 					if sev >= sevRank(verdict.SevHigh) {
 						sawCredentialRead = true
+					} else if class == "npm-token" || class == "netrc" {
+						sawTokenRead = true
 					}
 					sigs = append(sigs, verdict.Signal{
 						Stage: "behavior", Rule: "sensitive-read:" + class, Severity: sevOf(sev),
@@ -86,6 +90,15 @@ func Analyze(eco verdict.Ecosystem, tr *Trace) []verdict.Signal {
 					Description: "connects to a cryptomining-pool port during " + phase,
 					Evidence:    fmt.Sprintf("%s:%d", s.Address, s.Port),
 				})
+			case connectsHardcodedIP(s):
+				// A connect-back to a public IP with no prior DNS resolution — the
+				// hardcoded-C2 shape. unknown-domain is DNS-shaped and never sees this
+				// (raw-IP reverse shells / beacons: elf-stats-*). High -> quarantine.
+				sigs = append(sigs, verdict.Signal{
+					Stage: "behavior", Rule: "hardcoded-ip-egress", Severity: verdict.SevHigh,
+					Description: "connects to a hardcoded public IP with no DNS lookup during " + phase,
+					Evidence:    fmt.Sprintf("%s:%d", s.Address, s.Port),
+				})
 			}
 		}
 		for _, d := range p.DNS {
@@ -121,8 +134,11 @@ func Analyze(eco verdict.Ecosystem, tr *Trace) []verdict.Signal {
 	}
 
 	// Exfil chain: reading credentials AND reaching an unknown destination is the
-	// canonical stealer shape — escalate to make the composite explicit.
-	if sawCredentialRead && hasUnknownEgress(eco, tr) {
+	// canonical stealer shape — escalate to make the composite explicit. Registry
+	// tokens (.npmrc/.netrc) count here even though the read alone is baseline noise:
+	// a benign install reads them but only reaches the whitelisted registry, so the
+	// composite (token read + UNKNOWN egress) stays precise while catching real theft.
+	if (sawCredentialRead || sawTokenRead) && hasUnknownEgress(eco, tr) {
 		sigs = append(sigs, verdict.Signal{
 			Stage: "behavior", Rule: "exfil-chain", Severity: verdict.SevCritical,
 			Description: "reads credential material and contacts an unknown destination (exfiltration pattern)",
@@ -360,7 +376,7 @@ func hasPrefixAny(s string, prefs ...string) bool {
 func hasUnknownEgress(eco verdict.Ecosystem, tr *Trace) bool {
 	for _, p := range tr.Analysis {
 		for _, s := range p.Sockets {
-			if isMetadataEndpoint(s.Address) {
+			if isMetadataEndpoint(s.Address) || connectsHardcodedIP(s) {
 				return true
 			}
 		}
@@ -377,6 +393,51 @@ func hasUnknownEgress(eco verdict.Ecosystem, tr *Trace) bool {
 
 func isMetadataEndpoint(addr string) bool {
 	return addr == "169.254.169.254" || addr == "169.254.170.2"
+}
+
+// connectsHardcodedIP reports a connection to a routable public IP that was NOT
+// resolved from a hostname — the hardcoded-C2 shape that unknown-domain (DNS-based)
+// cannot see. A resolved connection carries its Hostnames (judged via the DNS path);
+// an empty/self-IP Hostnames means the code dialed a literal address.
+func connectsHardcodedIP(s Socket) bool {
+	for _, h := range s.Hostnames {
+		if h != "" && h != s.Address {
+			return false // resolved from a domain — the DNS path judges it
+		}
+	}
+	return isRoutablePublicIP(s.Address)
+}
+
+// isRoutablePublicIP reports whether addr is a public, routable IPv4 address —
+// excluding private, loopback, link-local (incl. cloud metadata), CGNAT, the
+// documentation/TEST-NET ranges (which include the detonation sinkhole), and the
+// well-known public DNS resolvers that benign code legitimately hardcodes.
+func isRoutablePublicIP(addr string) bool {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false // IPv4 only; traces are IPv4
+	}
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	a, b, c := int(ip4[0]), int(ip4[1]), int(ip4[2])
+	switch {
+	case a == 100 && b >= 64 && b <= 127: // CGNAT 100.64/10
+		return false
+	case a == 192 && b == 0 && c == 2, a == 198 && b == 51 && c == 100, a == 203 && b == 0 && c == 113: // TEST-NET / sinkhole
+		return false
+	case a >= 240: // reserved / class-E
+		return false
+	}
+	switch addr { // benign hardcoded public DNS
+	case "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9", "208.67.222.222", "208.67.220.220":
+		return false
+	}
+	return true
 }
 
 // registryWhitelist is the set of domain suffixes a package may legitimately
