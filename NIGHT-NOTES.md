@@ -23,7 +23,16 @@ the sandbox, and detonated a **205-npm batch** behind the sinkhole, saving every
 - **Corpus saved**: 195 traces + 206 logs → `eval-captures/2026-07-24-export-fuzzing-corpus.tgz`
   (gitignored). Burner torn down.
 - Serial-only (concurrent detonation hit a gVisor container-creation race); pypi still
-  dep-undercounted. Codex panel still parked.
+  dep-undercounted.
+
+**Codex panel (third tier), run over the 9 residual** (`docs/eval/2026-07-24-codex-panel.md`):
+behavior-reviewer + source-reviewer + combiner (gpt-5.6-sol medium) over trace+source.
+**Caught 6/9** of what static AND behavioral both missed — including the raw-IP `.pipe()`
+reverse shell (panel reasoned about the shell wiring directly, conf 1.0) and `plugin-vue`
+reading `.npmrc` at install. It also correctly *allowed* `psalm` (postinstall SyntaxError'd,
+inert) — it discriminates, not a klaxon. So the layered picture: static 45→53%, +behavioral
+npm 84%, +panel recovers ~⅔ of the remaining residual. The panel is the expensive tier
+(27 codex calls for 9 pkgs) — gate it to ambiguous cases, which the live gate already does.
 
 ## What got done
 
